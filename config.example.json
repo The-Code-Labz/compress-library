@@ -1,0 +1,11 @@
+{
+  "estimate_ratio": 0.45,
+  "encoder_blacklist": {
+    ".ts": [],
+    ".avi": []
+  },
+  "notes": {
+    "estimate_ratio": "Used only for --dry-run size estimates. Tune after you see real results.",
+    "encoder_blacklist": "Map extension -> list of encoders to never use for it. Example: {'.ts': ['qsv_h265']} forces NVENC for .ts files if QSV quality is lacking. Empty list = no restriction. List BOTH encoders to skip the extension entirely."
+  }
+}

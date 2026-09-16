@@ -1,0 +1,18 @@
+# Runtime artifacts
+manifest.db
+manifest.db-journal
+*.log
+temp/
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS/editor
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
