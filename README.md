@@ -38,10 +38,42 @@ pip install -r requirements.txt
 ```
 
 Restart the terminal afterward so PATH picks up both binaries. On Linux,
-`HandBrakeCLI` + `ffmpeg` from your distro packages work the same way.
+`HandBrakeCLI` + `ffmpeg` from your distro packages work the same way (Tkinter
+also needs a system package on Linux, e.g. `apt install python3-tk`; it ships
+built into the standard Windows/macOS Python installers).
 
 > **QSV on Arc:** make sure the Intel Arc graphics driver is current — old drivers
 > break Quick Sync encode in HandBrake. Run the preflight check below to confirm.
+
+## GUI
+
+A desktop control panel is included (`gui.py`, stdlib Tkinter — no extra deps
+beyond `requirements.txt`):
+
+```powershell
+python gui.py
+```
+
+It never imports or modifies `compress_library.py` — it only builds a CLI
+invocation from the form fields and launches `compress_library.py` as a
+subprocess, so the encode/verify/replace core stays exactly as battle-tested
+above. Features:
+
+- **Library / Options** — root folder picker, min size, quality (RF),
+  encoder checkboxes (QSV/NVENC), GPU assign, temp dir, duration tolerance,
+  timeout, manifest/log/config paths, preset file, extra HandBrakeCLI args,
+  resume toggle.
+- **Preflight** — runs `compress_library.py preflight` and streams the result.
+- **Dry Run** — runs `--dry-run` and renders candidates into a sortable table
+  (size, codec, estimated output) instead of raw text.
+- **Start / Stop** — runs a real batch; Stop kills the whole process tree
+  (via `psutil`, if installed) so an in-flight HandBrakeCLI child doesn't
+  survive as an orphan.
+- **Log tab** — live tail of the subprocess's stdout/log stream.
+- **Manifest tab** — reads `manifest.db` read-only and shows status/ratio/
+  attempts/error per file; auto-refreshes while a batch runs.
+- **Config tab** — view/edit `config.json` (`estimate_ratio`,
+  `encoder_blacklist`) and save it back.
 
 ## Usage
 
