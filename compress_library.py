@@ -33,7 +33,7 @@ try:
 except ImportError:  # pragma: no cover
     psutil = None
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 HEVC_CODEC_NAMES = {"hevc"}          # ffprobe codec_name values meaning "already H.265"
@@ -324,7 +324,8 @@ def set_low_priority(proc: subprocess.Popen):
 
 def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
                      preset_import: str | None, extra_args: list[str],
-                     hb_bin: str, timeout: int, deinterlace: bool = False) -> None:
+                     hb_bin: str, timeout: int, deinterlace: bool = False,
+                     gpu_index: int | None = None) -> None:
     args = [
         hb_bin,
         "-i", str(src),
@@ -346,6 +347,11 @@ def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
         # apply even if a handful of frames in an otherwise-interlaced source
         # are progressive.
         args += ["--comb-detect=default", "--decomb=default"]
+    if gpu_index is not None:
+        # Pins the actual encode adapter. Placed before extra_args so a
+        # user-supplied --encopts in extra_arg still wins (HandBrakeCLI uses
+        # the last occurrence of a repeated option).
+        args += ["--encopts", f"gpu={gpu_index}"]
     if preset_import:
         args += ["--preset-import-file", preset_import]
     args += extra_args
@@ -428,8 +434,10 @@ def scan(root: Path, min_bytes: int, manifest: Manifest, resume: bool,
 
 
 def process_file(src: Path, args, encoders: list[str], manifest: Manifest,
-                 worker_idx: int) -> str:
-    encoder = encoders[worker_idx % len(encoders)]
+                 worker_idx: int, gpu_assign: list[int] | None = None) -> str:
+    slot = worker_idx % len(encoders)
+    encoder = encoders[slot]
+    gpu_index = gpu_assign[slot] if gpu_assign and slot < len(gpu_assign) else None
     size = src.stat().st_size
 
     # 1. Locked by Plex/Jellyfin/etc?
@@ -456,13 +464,15 @@ def process_file(src: Path, args, encoders: list[str], manifest: Manifest,
     mode = getattr(args, "interlace_mode", "auto")
     deinterlace = resolve_interlaced(src, info, mode) if info else (mode == "force")
     manifest.set_status(str(src), size, "encoding", encoder=encoder)
-    log.info("ENCODE [%s]%s %s (%.2f GiB)", encoder,
+    log.info("ENCODE [%s%s]%s %s (%.2f GiB)", encoder,
+             f" gpu={gpu_index}" if gpu_index is not None else "",
              " [interlaced: decomb enabled]" if deinterlace else "", src, size / GiB)
     t0 = time.time()
     try:
         handbrake_encode(src, dst, encoder, args.quality, args.preset,
                          args.extra_arg or [], args.handbrake_cli,
-                         args.timeout, deinterlace=deinterlace)
+                         args.timeout, deinterlace=deinterlace,
+                         gpu_index=gpu_index)
     except Exception as exc:  # noqa: BLE001 - any encode failure must not kill the batch
         dst.unlink(missing_ok=True)
         log.error("FAIL (encode) %s: %s", src, exc)
@@ -515,7 +525,8 @@ def cmd_run(args) -> int:
     gpu_assign = [int(g) for g in str(args.gpu_assign).split(",")]
     if len(gpu_assign) != len(encoders):
         log.warning("--gpu-assign has %d entries for %d encoders; "
-                    "HandBrakeCLI adapter pinning is advisory (see README)",
+                    "extra/missing entries are ignored, unmapped encoders "
+                    "get no --encopts gpu= pin (see README)",
                     len(gpu_assign), len(encoders))
     encoder_blacklist: dict[str, list[str]] = cfg.get("encoder_blacklist", {})
     est_ratio = float(cfg.get("estimate_ratio", 0.45))
@@ -567,7 +578,7 @@ def cmd_run(args) -> int:
     with ThreadPoolExecutor(max_workers=len(encoders),
                             thread_name_prefix="encoder") as pool:
         futures = {
-            pool.submit(process_file, p, args, encoders, manifest, i): p
+            pool.submit(process_file, p, args, encoders, manifest, i, gpu_assign): p
             for i, p in enumerate(candidates)
         }
         for fut in as_completed(futures):
@@ -662,8 +673,8 @@ def build_parser() -> argparse.ArgumentParser:
                      default=["qsv_h265", "nvenc_h265"],
                      help="encoder(s); pass both for one-encode-per-GPU (default both)")
     run.add_argument("--gpu-assign", default="0,1",
-                     help="GPU adapter index per encoder, comma list (default 0,1; "
-                          "advisory - see README caveats)")
+                     help="GPU adapter index per encoder, comma list (default 0,1); "
+                          "sent as --encopts gpu=N per matching --encoder slot")
     run.add_argument("--preset", metavar="FILE",
                      help="HandBrake preset JSON to import (--preset-import-file)")
     run.add_argument("--extra-arg", action="append",

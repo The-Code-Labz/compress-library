@@ -119,7 +119,7 @@ without typing `run`.
 | `--min-size` | `2` | Skip files smaller than this many GB. |
 | `--quality` | `25` | HandBrake RF constant quality. Lower = better/bigger. 20–28 is the useful range. |
 | `--encoder` | both | `qsv_h265` and/or `nvenc_h265`. Passing both runs one encode per GPU. |
-| `--gpu-assign` | `0,1` | Advisory GPU adapter index per encoder. See caveats below. |
+| `--gpu-assign` | `0,1` | Per-encoder GPU adapter index, forwarded to HandBrakeCLI as `--encopts gpu=N` on that encoder's jobs. See [Finding your GPU index](#finding-your-gpu-index) and caveats below. |
 | `--preset` | — | HandBrake preset JSON (`--preset-import-file`). CLI flags still override the preset. |
 | `--extra-arg` | — | Repeatable raw HandBrakeCLI args, e.g. `--extra-arg=--encopts=tune=ssim`. |
 | `--temp-dir` | `./temp` | SSD scratch dir for encodes. Must have free space ≥ your largest file. |
@@ -155,6 +155,36 @@ if the interlace call is a false positive on a handful of frames.
 review before committing to a batch. Use `--interlace-mode off` to disable
 detection entirely (old behavior), or `force` to always deinterlace.
 
+## Finding your GPU index
+
+`--gpu-assign` indexes are **not** the order Windows/Device Manager/preflight
+list adapters in — they're Intel's oneVPL child-device index (for QSV) and
+CUDA's device order (for NVENC), which HandBrakeCLI passes straight through
+via `--encopts gpu=N`. There's no single command that maps "adapter #3 in
+Device Manager" to "gpu=N" ahead of time, so find it empirically:
+
+1. Run `compress-library preflight` — it lists every GPU Windows sees, in
+   Device Manager order, purely for identification (this list is **not**
+   the index order).
+2. Start a real encode (`compress-library-gui` → Start, or `run` without
+   `--dry-run`) with your current guess, e.g. `--gpu-assign 0,1`.
+3. Open Task Manager → Performance tab → select each GPU tile → watch the
+   **Video Encode** engine graph (not "3D" or "Copy") for each one while the
+   job runs. Whichever GPU's Video Encode graph spikes is the one that index
+   actually mapped to.
+4. If QSV (`qsv_h265`) lit up the wrong Intel adapter (e.g. UHD 770 instead
+   of Arc), or NVENC landed on the wrong card, flip the corresponding number
+   — e.g. try `--gpu-assign 1,0`, or `2,0` if you have more than two GPUs on
+   that vendor's side — and re-test. Indexes are usually small integers
+   starting at 0 per-vendor, not a shared global list across QSV+NVENC.
+5. `--log` / the Log tab also shows `ENCODE [qsv_h265 gpu=1] ...` per file so
+   you can confirm which index was actually sent, without guessing from the
+   command line.
+
+Once you find the pair that lights up the correct adapters, it's stable for
+that machine — no need to re-check on future runs unless you change hardware
+or GPU drivers.
+
 ## Config (`config.json`, optional)
 
 Copy `config.example.json` → `config.json` in the tool dir.
@@ -166,13 +196,17 @@ Copy `config.example.json` → `config.json` in the tool dir.
 
 ## Caveats worth knowing
 
-- **GPU adapter pinning is advisory.** HandBrakeCLI does not expose a clean
-  per-adapter flag for either QSV or NVENC — encoders typically bind to the
-  primary/Discrete GPU. `--gpu-assign` is recorded and validated, but on a
-  mixed Arc + RTX box, expect QSV to land on the Arc and NVENC on the RTX as
-  long as Arc is the compute/encode-preferred adapter in Intel graphics
-  settings. Watch the log lines `ENCODE [qsv_h265] ...` to confirm behavior
-  on your box; the preflight GPU list tells you what Windows sees.
+- **GPU adapter pinning is enforced via `--encopts gpu=N`**, one entry of
+  `--gpu-assign` per `--encoder` slot (round-robin: worker N gets
+  `encoders[N % len(encoders)]` and `gpu_assign[N % len(encoders)]` — they
+  always pair up). If you supply your own conflicting `--encopts` via
+  `--extra-arg`, yours wins (HandBrakeCLI honors the last occurrence of a
+  repeated option). See [Finding your GPU index](#finding-your-gpu-index) to
+  determine which number maps to which physical card on your box — the
+  preflight adapter list is Device Manager order, not the `gpu=` index.
+  NVENC has a known upstream driver quirk (HandBrake #7308) where some driver
+  versions ignore `gpu=` and always use GPU 0 — only relevant if you have
+  more than one NVIDIA GPU.
 - **Audio is passthrough by default** — `--aencoder copy`. Some exotic audio
   (TrueHD, DTS:X) falls back to `ffac3` per `--audio-fallback`; that's by design.
 - **`.avi` / `.ts` sources** keep their exact original filename (per spec) but
