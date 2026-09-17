@@ -34,13 +34,25 @@ box stays responsive for Plex/Jellyfin and everything else.
 ```powershell
 winget install HandBrake.HandBrakeCLI
 winget install ffmpeg          # provides ffprobe; or install ffmpeg and add to PATH
-pip install -r requirements.txt
+pip install -e .
 ```
 
 Restart the terminal afterward so PATH picks up both binaries. On Linux,
 `HandBrakeCLI` + `ffmpeg` from your distro packages work the same way (Tkinter
 also needs a system package on Linux, e.g. `apt install python3-tk`; it ships
 built into the standard Windows/macOS Python installers).
+
+`pip install -e .` registers two commands on PATH (a virtualenv is recommended):
+
+```bash
+compress-library preflight
+compress-library /path/to/library --dry-run
+compress-library-gui
+```
+
+`compress-library` also accepts `run` explicitly (`compress-library run /path/to/library ...`)
+— the bare form is just a shorthand. If you'd rather not install the package,
+`python compress_library.py ...` / `python gui.py` still work exactly the same.
 
 > **QSV on Arc:** make sure the Intel Arc graphics driver is current — old drivers
 > break Quick Sync encode in HandBrake. Run the preflight check below to confirm.
@@ -51,7 +63,8 @@ A desktop control panel is included (`gui.py`, stdlib Tkinter — no extra deps
 beyond `requirements.txt`):
 
 ```powershell
-python gui.py
+compress-library-gui     # if installed via `pip install -e .`
+python gui.py            # or run the script directly
 ```
 
 It never imports or modifies `compress_library.py` — it only builds a CLI
