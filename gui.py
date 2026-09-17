@@ -86,6 +86,7 @@ DRY_ROW_RE = re.compile(
     r"(?:, interlaced=(?P<interlaced>yes|no))?(?:, est\. out ~(?P<est>[\d.]+) GiB)?\]$"
 )
 DRY_SKIP_RE = re.compile(r"^\s{2}SKIP \(already H\.265\) (?P<path>.+?)\s+\[(?P<size>[\d.]+) GiB, codec=(?P<codec>\S+)\]$")
+DRY_RECOMPRESS_PREFIX_RE = re.compile(r"^\s{2}RECOMPRESS \(oversized H\.265\) ")
 
 PROC_DONE = "\x00PROC_DONE\x00"
 
@@ -230,6 +231,7 @@ class CompressLibraryGUI:
         self.var_hb_bin = tk.StringVar(value="HandBrakeCLI")
         self.var_preset = tk.StringVar()
         self.var_interlace_mode = tk.StringVar(value="auto")
+        self.var_recompress_hevc_over = tk.DoubleVar(value=0.0)
 
         r = 0
         self._field(opts, r, 0, "Min size (GB)", ttk.Spinbox(opts, textvariable=self.var_min_size, from_=0, to=1000, increment=0.5, width=10))
@@ -258,6 +260,10 @@ class CompressLibraryGUI:
         self._field(opts, r, 2, "Interlace mode",
                     ttk.Combobox(opts, textvariable=self.var_interlace_mode,
                                  values=("auto", "force", "off"), state="readonly", width=10))
+        r += 1
+        self._field(opts, r, 0, "Recompress HEVC over (GB)",
+                    ttk.Spinbox(opts, textvariable=self.var_recompress_hevc_over,
+                                from_=0, to=1000, increment=0.5, width=10))
         r += 1
         ttk.Label(opts, text="Extra HandBrakeCLI args\n(one per line)").grid(row=r, column=0, sticky="nw", padx=6, pady=4)
         self.txt_extra_args = tk.Text(opts, height=3, width=50)
@@ -381,6 +387,8 @@ class CompressLibraryGUI:
         if dry_run:
             args.append("--dry-run")
         args += ["--min-size", str(self.var_min_size.get())]
+        if self.var_recompress_hevc_over.get() > 0:
+            args += ["--recompress-hevc-over", str(self.var_recompress_hevc_over.get())]
         args += ["--quality", str(self.var_quality.get())]
         args += ["--encoder", *encoders]
         args += ["--gpu-assign", self.var_gpu_assign.get().strip() or "0,1"]
@@ -578,7 +586,9 @@ class CompressLibraryGUI:
                 self.tree_preview.insert("", "end", values=(
                     m.group("path"), m.group("size"), m.group("codec"), "-", "already H.265", "-"))
                 continue
-            m = DRY_ROW_RE.match(line)
+            recompress = bool(DRY_RECOMPRESS_PREFIX_RE.match(line))
+            line_for_row = DRY_RECOMPRESS_PREFIX_RE.sub("  ", line) if recompress else line
+            m = DRY_ROW_RE.match(line_for_row)
             if m:
                 size = float(m.group("size"))
                 est = float(m.group("est")) if m.group("est") else 0.0
@@ -587,7 +597,8 @@ class CompressLibraryGUI:
                 enc_count += 1
                 self.tree_preview.insert("", "end", values=(
                     m.group("path"), f"{size:.2f}", m.group("codec"),
-                    m.group("interlaced") or "-", "to encode", f"{est:.2f}"))
+                    m.group("interlaced") or "-",
+                    "recompress (oversized HEVC)" if recompress else "to encode", f"{est:.2f}"))
         self.var_preview_summary.set(
             f"{enc_count} to encode ({total_in:.2f} GiB -> ~{total_est:.2f} GiB est.), "
             f"{skip_count} already H.265"

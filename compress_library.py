@@ -32,7 +32,7 @@ try:
 except ImportError:  # pragma: no cover
     psutil = None
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 HEVC_CODEC_NAMES = {"hevc"}          # ffprobe codec_name values meaning "already H.265"
@@ -463,12 +463,20 @@ def process_file(src: Path, args, encoder: str, manifest: Manifest,
         manifest.set_status(str(src), size, "locked")
         return "locked"
 
-    # 2. Already H.265?
+    # 2. Already H.265? Skip unless it's oversized enough that HandBrake at
+    # this quality/RF setting could still meaningfully shrink it (e.g. a
+    # high-bitrate HEVC remux that was itself encoded at a low RF) - only
+    # applies when --recompress-hevc-over is set; 0/unset preserves the
+    # original "never touch HEVC" behavior.
     info = stream_info(src)
+    recompress_over = getattr(args, "recompress_hevc_over", 0.0) or 0.0
     if info and is_h265(info):
-        log.info("SKIP (already H.265) %s", src)
-        manifest.set_status(str(src), size, "skipped-hevc")
-        return "skipped-hevc"
+        if not (recompress_over > 0 and size >= recompress_over * GiB):
+            log.info("SKIP (already H.265) %s", src)
+            manifest.set_status(str(src), size, "skipped-hevc")
+            return "skipped-hevc"
+        log.info("RECOMPRESS (oversized H.265, %.2f GiB >= %.2f GiB threshold) %s",
+                  size / GiB, recompress_over, src)
 
     # 3. Encode to temp dir. Prefix with a hash of the full source path so two
     # files that share a basename in different library folders (common with
@@ -555,6 +563,8 @@ def cmd_run(args) -> int:
                       resume=args.resume, encoder_blacklist=encoder_blacklist,
                       encoders=encoders)
 
+    recompress_over = getattr(args, "recompress_hevc_over", 0.0) or 0.0
+
     if args.dry_run:
         total = 0
         rows = []
@@ -564,7 +574,7 @@ def cmd_run(args) -> int:
             except OSError:
                 continue
             info = stream_info(p)
-            if info and is_h265(info):
+            if info and is_h265(info) and not (recompress_over > 0 and size >= recompress_over * GiB):
                 rows.append((p, size, info, True))
                 continue
             rows.append((p, size, info, False))
@@ -579,7 +589,8 @@ def cmd_run(args) -> int:
             total += size
             interlaced = resolve_interlaced(p, info, args.interlace_mode) if info \
                 else (args.interlace_mode == "force")
-            print(f"  {p}  [{size / GiB:.2f} GiB, codec={codec}, "
+            recompress_prefix = "RECOMPRESS (oversized H.265) " if (info and is_h265(info)) else ""
+            print(f"  {recompress_prefix}{p}  [{size / GiB:.2f} GiB, codec={codec}, "
                   f"interlaced={'yes' if interlaced else 'no'}, "
                   f"est. out ~{est / GiB:.2f} GiB]")
         print(f"\nTotal input: {total / GiB:.2f} GiB | "
@@ -704,6 +715,12 @@ def build_parser() -> argparse.ArgumentParser:
                      help="list what would be encoded; encode nothing")
     run.add_argument("--min-size", type=float, default=2.0,
                      help="skip files smaller than this many GB (default 2)")
+    run.add_argument("--recompress-hevc-over", type=float, default=0.0,
+                     help="re-encode already-HEVC files at or above this many GB "
+                          "instead of unconditionally skipping them (default 0 = "
+                          "disabled, HEVC is always skipped). Use for oversized "
+                          "HEVC remuxes that were themselves encoded at a low RF "
+                          "and can still shrink further at this run's --quality")
     run.add_argument("--quality", type=float, default=25.0,
                      help="HandBrake constant-quality RF (default 25)")
     run.add_argument("--encoder", nargs="+",

@@ -16,7 +16,7 @@ box stays responsive for Plex/Jellyfin and everything else.
 ## How it works
 
 1. Recursively find `.mkv .mp4 .m4v .avi .ts` larger than `--min-size` GB (default 2).
-2. Files already H.265 are skipped (ffprobe codec check).
+2. Files already H.265 are skipped (ffprobe codec check) — unless `--recompress-hevc-over` is set (see below), which re-queues oversized HEVC files instead of skipping them.
 3. Files locked/open by another process (Plex, Jellyfin, a player) are skipped, logged, and retried on the next run — never fatal.
 4. Each file is encoded **to a temp dir on your SSD** — the source is never touched mid-encode.
    Audio and subtitles pass through untouched (`--all-audio --aencoder copy --all-subtitles`).
@@ -72,10 +72,11 @@ invocation from the form fields and launches `compress_library.py` as a
 subprocess, so the encode/verify/replace core stays exactly as battle-tested
 above. Features:
 
-- **Library / Options** — root folder picker, min size, quality (RF),
-  encoder checkboxes (QSV/NVENC), GPU assign, temp dir, duration tolerance,
-  interlace mode (auto/force/off), timeout, manifest/log/config paths,
-  preset file, extra HandBrakeCLI args, resume toggle.
+- **Library / Options** — root folder picker, min size, recompress-HEVC-over
+  threshold, quality (RF), encoder checkboxes (QSV/NVENC), GPU assign, temp
+  dir, duration tolerance, interlace mode (auto/force/off), timeout,
+  manifest/log/config paths, preset file, extra HandBrakeCLI args, resume
+  toggle.
 - **Preflight** — runs `compress_library.py preflight` and streams the result.
 - **Dry Run** — runs `--dry-run` and renders candidates into a sortable table
   (size, codec, interlaced, estimated output) instead of raw text.
@@ -117,6 +118,7 @@ without typing `run`.
 |---|---|---|
 | `--dry-run` | off | List candidates with sizes + estimated output. Encodes nothing. |
 | `--min-size` | `2` | Skip files smaller than this many GB. |
+| `--recompress-hevc-over` | `0` (off) | Re-encode already-HEVC files whose size is ≥ this many GB, instead of always skipping HEVC. Useful for oversized HEVC remuxes that were themselves encoded at a low RF and can still shrink further at this run's `--quality`. The existing verification gate still applies — if the re-encode doesn't come out smaller than the source, it fails verification and the original is left untouched. `0` (default) preserves the original "never touch HEVC" behavior. |
 | `--quality` | `25` | HandBrake RF constant quality. Lower = better/bigger. 20–28 is the useful range. |
 | `--encoder` | both | `qsv_h265` and/or `nvenc_h265`. Passing both runs one encode per GPU. |
 | `--gpu-assign` | `0,1` | Per-encoder adapter index. For `nvenc_h265` this is a CUDA device index sent as `--encopts gpu=N`; for `qsv_h265` this is a oneVPL adapter index sent as the top-level `--qsv-adapter=N` flag (they are two different mechanisms — see [Finding your GPU index](#finding-your-gpu-index) and caveats below). |
