@@ -32,7 +32,7 @@ try:
 except ImportError:  # pragma: no cover
     psutil = None
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 HEVC_CODEC_NAMES = {"hevc"}          # ffprobe codec_name values meaning "already H.265"
@@ -92,7 +92,18 @@ def stream_info(path: Path) -> dict | None:
         return None
     streams = data.get("streams", [])
     audio = sum(1 for s in streams if s.get("codec_type") == "audio")
-    subtitles = sum(1 for s in streams if s.get("codec_type") == "subtitle")
+    # eia_608/eia_708 are embedded closed-caption data ffprobe reports as a
+    # pseudo "subtitle" stream (common on Blu-ray remuxes). HandBrake's
+    # scanner does not enumerate these as selectable subtitle tracks, so
+    # --all-subtitles never copies them - counting them here made verify()
+    # fail almost every title with an off-by-one "subtitle tracks N < input
+    # N+1" false positive, even though nothing real was actually lost.
+    _NON_TRACK_SUBTITLE_CODECS = {"eia_608", "eia_708"}
+    subtitles = sum(
+        1 for s in streams
+        if s.get("codec_type") == "subtitle"
+        and (s.get("codec_name") or "").lower() not in _NON_TRACK_SUBTITLE_CODECS
+    )
     video = next((s for s in streams if s.get("codec_type") == "video"), {})
     duration = 0.0
     try:
@@ -390,7 +401,19 @@ def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
         "--audio-copy-mask", "aac,ac3,eac3,dts,dtshd,truehd,mp3,flac,opus",
         "--audio-fallback", "ffac3",
         "--all-subtitles",
-        "--subtitle-burned", "none",
+        # --subtitle-burned takes an OPTIONAL argument (getopt_long style:
+        # "[=number, \"native\", or \"none\"]"). Passing it as two separate
+        # argv tokens ("--subtitle-burned", "none") does NOT bind "none" as
+        # the value - getopt treats the option as given with no argument at
+        # all, which falls back to its documented no-argument default:
+        # "if number is omitted, the first track is burned". That silently
+        # burned-in the first (usually default-flagged) subtitle track on
+        # every single encode, dropping it from the passthrough count and
+        # causing verify()'s near-universal "subtitle tracks N < input N+1"
+        # false failure. Confirmed via a live HandBrakeCLI --verbose=1 trace
+        # (space form: "-> Render/Burn-in, Default"; "=" form: "-> Passthru,
+        # Default"). Must be one joined token.
+        "--subtitle-burned=none",
         "--optimize",
     ]
     if deinterlace:
@@ -415,7 +438,18 @@ def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
         if encoder.startswith("nvenc"):
             args += ["--encopts", f"gpu={gpu_index}"]
         elif encoder.startswith("qsv"):
-            args += ["--qsv-adapter", str(gpu_index)]
+            # --qsv-adapter is declared as a getopt_long OPTIONAL-argument
+            # flag ("--qsv-adapter[=index]"), same family as
+            # --subtitle-burned above which was CONFIRMED to silently drop
+            # a two-token "--subtitle-burned none" value. Live-traced
+            # --qsv-adapter itself and its two-token form did bind
+            # correctly in this HandBrakeCLI build (confirmed a bad index
+            # via space form produced "failed to create hwdevice" - i.e.
+            # the value WAS received), but the single joined "=" token is
+            # the form HandBrake's own --help documents and is unambiguous
+            # under getopt_long, so use it defensively rather than rely on
+            # this build's specific (undocumented) leniency.
+            args += [f"--qsv-adapter={gpu_index}"]
     if preset_import:
         args += ["--preset-import-file", preset_import]
     args += extra_args

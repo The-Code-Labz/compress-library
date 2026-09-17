@@ -159,6 +159,20 @@ detection entirely (old behavior), or `force` to always deinterlace.
 
 ## Finding your GPU index
 
+**Confirmed via a live `--verbose=1` oneVPL device-enumeration trace on the
+Arc A580 + UHD 770 reference box this tool targets:** oneVPL's own index
+order is `0 = integrated (UHD 770)`, `1 = discrete (Arc A580)`. That is,
+`--gpu-assign N,0` where `N` is `1` targets Arc for `qsv_h265`. This is
+**not guaranteed on other hardware/driver combinations** (integrated vs.
+discrete ordering can differ by system) — verify empirically per the steps
+below before assuming this pairing on a different box. Also note: forcing
+this index made no visible difference on the reference box, because
+HandBrake's own no-flag default already picks "the adapter with the highest
+hardware generation" (Arc, correctly, on this hardware) — `--qsv-adapter`
+mainly matters when you *want* to override that default (e.g. force
+UHD-only to keep Arc free for something else), not to "fix" QSV landing on
+the wrong card by default.
+
 `--gpu-assign` indexes are **not** the order Windows/Device Manager/preflight
 list adapters in, and QSV and NVENC do **not** share the mechanism:
 
@@ -212,6 +226,34 @@ Copy `config.example.json` → `config.json` in the tool dir.
 
 ## Caveats worth knowing
 
+- **Fixed (v1.5.0): verify almost always failed with a false
+  `subtitle tracks N < input N+1` on virtually every title.** Root cause
+  confirmed with a live `HandBrakeCLI --verbose=1` trace: `--subtitle-burned`
+  is a `getopt_long` **optional-argument** flag
+  (`--subtitle-burned[=number, "native", or "none"]`). The command was built
+  as two separate argv tokens - `["--subtitle-burned", "none"]` - and
+  getopt_long does **not** bind a space-separated value to an optional-arg
+  flag; it silently treats the flag as given with no argument at all, which
+  falls back to its documented default: *"if number is omitted, the first
+  track is burned."* So every single encode was silently burning the first
+  subtitle track into the video (confirmed in the trace: `subtitle track 1
+  ... -> Render/Burn-in, Default`) regardless of the `none` we thought we'd
+  passed, dropping it from the passthrough count by exactly one - hence the
+  always-off-by-1 pattern across every title, independent of how many real
+  tracks it had. Switching to a single joined token, `--subtitle-burned=none`,
+  fixes it (verified in the same trace: `-> Passthru, Default`, no burn).
+  Nothing was ever actually lost (the safety gate kept every original
+  untouched, as designed) - the cost was purely wasted GPU time per title.
+  `--qsv-adapter` was changed to the same joined-token form defensively (see
+  GPU pinning note below) even though it was independently confirmed to
+  still bind correctly via space-separated args on this HandBrake build -
+  the joined form is what HandBrake's own `--help` documents and is
+  unambiguous under `getopt_long`, so there's no reason to rely on
+  build-specific leniency for an optional-arg flag.
+  (v1.4.1's `eia_608`/`eia_708` exclusion in `stream_info()` is kept as a
+  harmless defensive measure - some sources do carry those as pseudo
+  subtitle streams - but it was **not** the actual cause of the failures
+  seen in practice; the getopt binding bug above was.)
 - **GPU adapter pinning uses two different HandBrakeCLI mechanisms**, one
   entry of `--gpu-assign` per `--encoder` slot (candidates are split into a
   fixed lane per encoder up front — `encoders[N % len(encoders)]` gets every
