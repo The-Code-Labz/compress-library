@@ -32,10 +32,11 @@ try:
 except ImportError:  # pragma: no cover
     psutil = None
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 HEVC_CODEC_NAMES = {"hevc"}          # ffprobe codec_name values meaning "already H.265"
+AV1_CODEC_NAMES = {"av1"}            # ffprobe codec_name value meaning "already AV1"
 HEVC_TAGS = {"hvc1", "hev1"}         # mp4 codec_tag fallbacks
 GiB = 1024 ** 3
 
@@ -129,6 +130,20 @@ def stream_info(path: Path) -> dict | None:
 
 def is_h265(info: dict) -> bool:
     return info["video_codec"] in HEVC_CODEC_NAMES or info["codec_tag"] in HEVC_TAGS
+
+
+def is_av1(info: dict) -> bool:
+    return info["video_codec"] in AV1_CODEC_NAMES
+
+
+def already_compressed(info: dict) -> bool:
+    """HEVC or AV1 - both are "already efficient" codecs where a blanket
+    re-encode would be lossy-on-lossy, so both get the same skip treatment."""
+    return is_h265(info) or is_av1(info)
+
+
+def codec_label(info: dict) -> str:
+    return "AV1" if is_av1(info) else "H.265"
 
 
 def detect_interlaced_idet(path: Path, sample_frames: int = 100) -> bool | None:
@@ -351,6 +366,8 @@ def _pump_handbrake_output(proc: subprocess.Popen, tail: list[str],
     percentages to progress_cb, throttled to whole-percent steps."""
     buf = ""
     last_pct = -1.0
+    init_done = False
+    init_count = 0
     try:
         while True:
             chunk = proc.stdout.read(256)
@@ -370,12 +387,27 @@ def _pump_handbrake_output(proc: subprocess.Popen, tail: list[str],
                 del tail[:-40]
                 m = _HB_PROGRESS_RE.search(line)
                 if m and progress_cb:
+                    init_done = True
                     pct = float(m.group(1))
                     if pct - last_pct >= 1.0 or pct >= 100.0:
                         last_pct = pct
                         fps = m.group(3) or "?"
                         eta = m.group(4) or "?"
                         progress_cb(f"{pct:.1f}% (avg {fps} fps, ETA {eta})")
+                elif not init_done and progress_cb and init_count < 30:
+                    # Before the first progress line, HandBrakeCLI prints its
+                    # scan/init log - including the oneVPL/QSV adapter-selection
+                    # line ("Impl ... adapter index N") and NVENC/CUDA device
+                    # info. This is the only place that confirms which physical
+                    # GPU --qsv-adapter/--encopts gpu= actually bound to.
+                    # Previously it only lived in the 40-line rolling `tail`
+                    # (dumped on FAILURE only) - on a successful/still-running
+                    # job it silently scrolled out within seconds of the first
+                    # progress update, so --verbose=1 never actually showed
+                    # device selection in the Log tab no matter how long you
+                    # watched. Surface it explicitly, once, here.
+                    init_count += 1
+                    progress_cb(f"[init] {line}")
     except (ValueError, OSError):
         pass  # pipe closed under us (process killed on timeout) - not fatal
     finally:
@@ -437,7 +469,7 @@ def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
         # (HandBrakeCLI uses the last occurrence of a repeated option).
         if encoder.startswith("nvenc"):
             args += ["--encopts", f"gpu={gpu_index}"]
-        elif encoder.startswith("qsv"):
+        elif "qsv" in encoder:  # qsv_h265, av1_qsv - both are oneVPL/QSV adapters
             # --qsv-adapter is declared as a getopt_long OPTIONAL-argument
             # flag ("--qsv-adapter[=index]"), same family as
             # --subtitle-burned above which was CONFIRMED to silently drop
@@ -555,20 +587,20 @@ def process_file(src: Path, args, encoder: str, manifest: Manifest,
         manifest.set_status(str(src), size, "locked")
         return "locked"
 
-    # 2. Already H.265? Skip unless it's oversized enough that HandBrake at
+    # 2. Already HEVC/AV1? Skip unless it's oversized enough that HandBrake at
     # this quality/RF setting could still meaningfully shrink it (e.g. a
     # high-bitrate HEVC remux that was itself encoded at a low RF) - only
     # applies when --recompress-hevc-over is set; 0/unset preserves the
-    # original "never touch HEVC" behavior.
+    # original "never touch an already-compressed file" behavior.
     info = stream_info(src)
     recompress_over = getattr(args, "recompress_hevc_over", 0.0) or 0.0
-    if info and is_h265(info):
+    if info and already_compressed(info):
         if not (recompress_over > 0 and size >= recompress_over * GiB):
-            log.info("SKIP (already H.265) %s", src)
+            log.info("SKIP (already %s) %s", codec_label(info), src)
             manifest.set_status(str(src), size, "skipped-hevc")
             return "skipped-hevc"
-        log.info("RECOMPRESS (oversized H.265, %.2f GiB >= %.2f GiB threshold) %s",
-                  size / GiB, recompress_over, src)
+        log.info("RECOMPRESS (oversized %s, %.2f GiB >= %.2f GiB threshold) %s",
+                  codec_label(info), size / GiB, recompress_over, src)
 
     # 3. Encode to temp dir. Prefix with a hash of the full source path so two
     # files that share a basename in different library folders (common with
@@ -670,22 +702,22 @@ def cmd_run(args) -> int:
             except OSError:
                 continue
             info = stream_info(p)
-            if info and is_h265(info) and not (recompress_over > 0 and size >= recompress_over * GiB):
+            if info and already_compressed(info) and not (recompress_over > 0 and size >= recompress_over * GiB):
                 rows.append((p, size, info, True))
                 continue
             rows.append((p, size, info, False))
         print(f"\nDRY RUN - {sum(1 for r in rows if not r[3])} file(s) would be encoded "
-              f"({sum(1 for r in rows if r[3])} already H.265, skipped):\n")
-        for p, size, info, hevc in rows:
+              f"({sum(1 for r in rows if r[3])} already HEVC/AV1, skipped):\n")
+        for p, size, info, already in rows:
             codec = f"{info['video_codec'] or 'unknown'}" if info else "unprobeable"
-            if hevc:
-                print(f"  SKIP (already H.265) {p}  [{size / GiB:.2f} GiB, codec={codec}]")
+            if already:
+                print(f"  SKIP (already {codec_label(info)}) {p}  [{size / GiB:.2f} GiB, codec={codec}]")
                 continue
             est = size * est_ratio
             total += size
             interlaced = resolve_interlaced(p, info, args.interlace_mode) if info \
                 else (args.interlace_mode == "force")
-            recompress_prefix = "RECOMPRESS (oversized H.265) " if (info and is_h265(info)) else ""
+            recompress_prefix = f"RECOMPRESS (oversized {codec_label(info)}) " if (info and already_compressed(info)) else ""
             print(f"  {recompress_prefix}{p}  [{size / GiB:.2f} GiB, codec={codec}, "
                   f"interlaced={'yes' if interlaced else 'no'}, "
                   f"est. out ~{est / GiB:.2f} GiB]")
@@ -820,14 +852,18 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--quality", type=float, default=25.0,
                      help="HandBrake constant-quality RF (default 25)")
     run.add_argument("--encoder", nargs="+",
-                     choices=["qsv_h265", "nvenc_h265"],
+                     choices=["qsv_h265", "nvenc_h265", "av1_qsv"],
                      default=["qsv_h265", "nvenc_h265"],
-                     help="encoder(s); pass both for one-encode-per-GPU (default both)")
+                     help="encoder(s); pass both qsv_h265+nvenc_h265 for one-encode-per-GPU "
+                          "(default). av1_qsv uses Arc's AV1 hardware encode block instead of "
+                          "HEVC on the QSV lane (Arc-only; no consumer NVENC GPU can hardware-"
+                          "encode AV1 as of Ada/40-series, so there is no av1_nvenc) - e.g. "
+                          "--encoder av1_qsv nvenc_h265")
     run.add_argument("--gpu-assign", default="0,1",
                      help="adapter index per encoder, comma list (default 0,1); "
                           "for nvenc_h265 this is a CUDA device index sent as "
                           "--encopts gpu=N (only 0 is valid on a single-NVIDIA-GPU "
-                          "box); for qsv_h265 this is a oneVPL adapter index sent "
+                          "box); for qsv_h265/av1_qsv this is a oneVPL adapter index sent "
                           "as --qsv-adapter=N (0 = HandBrake's own default, "
                           "the highest hardware-generation Intel GPU present)")
     run.add_argument("--preset", metavar="FILE",

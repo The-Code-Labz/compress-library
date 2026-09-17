@@ -77,7 +77,7 @@ ENCODE_RE = re.compile(r"ENCODE \[(?P<enc>[\w_]+)\] (?P<path>.+?) \(")
 DONE_RE = re.compile(r"\bDONE (?P<path>.+?): .*\((?P<pct>[\d.]+)% of original\)")
 FAIL_RE = re.compile(r"\bFAIL \((?P<stage>\w+)\) (?P<path>.+?): (?P<reason>.+)")
 SKIP_LOCKED_RE = re.compile(r"SKIP \(locked\) (?P<path>.+)")
-SKIP_HEVC_RE = re.compile(r"SKIP \(already H\.265\) (?P<path>.+)")
+SKIP_HEVC_RE = re.compile(r"SKIP \(already (?:H\.265|AV1)\) (?P<path>.+)")
 SCAN_RE = re.compile(r"Scan: (?P<n>\d+) candidates")
 BATCH_DONE_RE = re.compile(r"Batch complete: (?P<summary>.+)")
 
@@ -85,8 +85,8 @@ DRY_ROW_RE = re.compile(
     r"^\s{2}(?P<path>.+?)\s+\[(?P<size>[\d.]+) GiB, codec=(?P<codec>\S+)"
     r"(?:, interlaced=(?P<interlaced>yes|no))?(?:, est\. out ~(?P<est>[\d.]+) GiB)?\]$"
 )
-DRY_SKIP_RE = re.compile(r"^\s{2}SKIP \(already H\.265\) (?P<path>.+?)\s+\[(?P<size>[\d.]+) GiB, codec=(?P<codec>\S+)\]$")
-DRY_RECOMPRESS_PREFIX_RE = re.compile(r"^\s{2}RECOMPRESS \(oversized H\.265\) ")
+DRY_SKIP_RE = re.compile(r"^\s{2}SKIP \(already (?:H\.265|AV1)\) (?P<path>.+?)\s+\[(?P<size>[\d.]+) GiB, codec=(?P<codec>\S+)\]$")
+DRY_RECOMPRESS_PREFIX_RE = re.compile(r"^\s{2}RECOMPRESS \(oversized (?:H\.265|AV1)\) ")
 
 PROC_DONE = "\x00PROC_DONE\x00"
 
@@ -220,6 +220,7 @@ class CompressLibraryGUI:
         self.var_quality = tk.DoubleVar(value=25.0)
         self.var_qsv = tk.BooleanVar(value=True)
         self.var_nvenc = tk.BooleanVar(value=True)
+        self.var_av1_qsv = tk.BooleanVar(value=False)
         self.var_gpu_assign = tk.StringVar(value="0,1")
         self.var_temp_dir = tk.StringVar()
         self.var_duration_tol = tk.DoubleVar(value=2.0)
@@ -242,6 +243,7 @@ class CompressLibraryGUI:
         encf.grid(row=r, column=1, sticky="w")
         ttk.Checkbutton(encf, text="qsv_h265 (GPU0)", variable=self.var_qsv).pack(side="left")
         ttk.Checkbutton(encf, text="nvenc_h265 (GPU1)", variable=self.var_nvenc).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(encf, text="av1_qsv (Arc, replaces qsv_h265)", variable=self.var_av1_qsv).pack(side="left", padx=(8, 0))
         self._field(opts, r, 2, "GPU assign", ttk.Entry(opts, textvariable=self.var_gpu_assign, width=12))
         r += 1
         self._field_browse(opts, r, 0, "Temp dir", self.var_temp_dir, dir_only=True)
@@ -375,7 +377,9 @@ class CompressLibraryGUI:
             messagebox.showerror("compress-library", "Choose a valid library root directory first.")
             return None
         encoders = []
-        if self.var_qsv.get():
+        if self.var_av1_qsv.get():
+            encoders.append("av1_qsv")  # replaces qsv_h265 on the same QSV/Arc lane
+        elif self.var_qsv.get():
             encoders.append("qsv_h265")
         if self.var_nvenc.get():
             encoders.append("nvenc_h265")
@@ -584,7 +588,8 @@ class CompressLibraryGUI:
             if m:
                 skip_count += 1
                 self.tree_preview.insert("", "end", values=(
-                    m.group("path"), m.group("size"), m.group("codec"), "-", "already H.265", "-"))
+                    m.group("path"), m.group("size"), m.group("codec"), "-",
+                    f"already {m.group('codec')}", "-"))
                 continue
             recompress = bool(DRY_RECOMPRESS_PREFIX_RE.match(line))
             line_for_row = DRY_RECOMPRESS_PREFIX_RE.sub("  ", line) if recompress else line
@@ -598,10 +603,11 @@ class CompressLibraryGUI:
                 self.tree_preview.insert("", "end", values=(
                     m.group("path"), f"{size:.2f}", m.group("codec"),
                     m.group("interlaced") or "-",
-                    "recompress (oversized HEVC)" if recompress else "to encode", f"{est:.2f}"))
+                    (f"recompress (oversized {m.group('codec')})" if recompress else "to encode"),
+                    f"{est:.2f}"))
         self.var_preview_summary.set(
             f"{enc_count} to encode ({total_in:.2f} GiB -> ~{total_est:.2f} GiB est.), "
-            f"{skip_count} already H.265"
+            f"{skip_count} already-compressed skipped"
         )
 
     # ------------------------------------------------------------------
