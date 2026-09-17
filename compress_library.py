@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -32,10 +33,19 @@ try:
 except ImportError:  # pragma: no cover
     psutil = None
 
+__version__ = "1.1.0"
+
 VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 HEVC_CODEC_NAMES = {"hevc"}          # ffprobe codec_name values meaning "already H.265"
 HEVC_TAGS = {"hvc1", "hev1"}         # mp4 codec_tag fallbacks
 GiB = 1024 ** 3
+
+# Codecs where ffprobe's `field_order` metadata is frequently absent/"unknown"
+# even on genuinely interlaced sources (common with older VC-1/MPEG-2 Blu-ray
+# remuxes). For these, an ambiguous field_order triggers a real idet sample
+# instead of being assumed progressive.
+INTERLACE_PRONE_CODECS = {"vc1", "mpeg2video", "mpeg1video"}
+INTERLACED_FIELD_ORDERS = {"tt", "bb", "tb", "bt"}
 
 TOOL_DIR = Path(__file__).resolve().parent
 DEFAULT_MANIFEST = TOOL_DIR / "manifest.db"
@@ -103,11 +113,64 @@ def stream_info(path: Path) -> dict | None:
         "subtitles": subtitles,
         "video_codec": (video.get("codec_name") or "").lower(),
         "codec_tag": (video.get("codec_tag_string") or "").lower(),
+        "field_order": (video.get("field_order") or "").lower(),
     }
 
 
 def is_h265(info: dict) -> bool:
     return info["video_codec"] in HEVC_CODEC_NAMES or info["codec_tag"] in HEVC_TAGS
+
+
+def detect_interlaced_idet(path: Path, sample_frames: int = 100) -> bool | None:
+    """Decode a short sample through ffmpeg's `idet` filter and compare
+    TFF/BFF vs progressive frame counts. Returns True/False, or None if
+    ffmpeg is unavailable or the sample couldn't be analyzed."""
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-an", "-sn",
+             "-i", str(path), "-frames:v", str(sample_frames),
+             "-filter:v", "idet", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    # ffmpeg can emit more than one "Multi frame detection" summary (e.g. an
+    # early near-zero snapshot before the final tally) - always take the
+    # last one, which reflects the full sample.
+    matches = re.findall(
+        r"Multi frame detection:\s*TFF:\s*(\d+)\s*BFF:\s*(\d+)\s*Progressive:\s*(\d+)",
+        out.stderr,
+    )
+    if not matches:
+        return None
+    tff, bff, progressive = (int(g) for g in matches[-1])
+    if tff + bff + progressive == 0:
+        return None
+    return (tff + bff) > progressive
+
+
+def check_interlaced(path: Path, info: dict) -> bool:
+    """Best-effort interlace detection: trust explicit field_order metadata
+    first (free); only fall back to a real ffmpeg idet sample when the
+    codec is known to under-report field_order (vc1/mpeg2/mpeg1)."""
+    fo = info.get("field_order", "")
+    if fo in INTERLACED_FIELD_ORDERS:
+        return True
+    if fo == "progressive":
+        return False
+    if info.get("video_codec") in INTERLACE_PRONE_CODECS:
+        result = detect_interlaced_idet(path)
+        if result is not None:
+            return result
+    return False
+
+
+def resolve_interlaced(path: Path, info: dict, mode: str) -> bool:
+    if mode == "off":
+        return False
+    if mode == "force":
+        return True
+    return check_interlaced(path, info)
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +324,7 @@ def set_low_priority(proc: subprocess.Popen):
 
 def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
                      preset_import: str | None, extra_args: list[str],
-                     hb_bin: str, timeout: int) -> None:
+                     hb_bin: str, timeout: int, deinterlace: bool = False) -> None:
     args = [
         hb_bin,
         "-i", str(src),
@@ -277,6 +340,12 @@ def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
         "--subtitle-burned", "none",
         "--optimize",
     ]
+    if deinterlace:
+        # `default` mode on both filters is frame-adaptive: comb-detect flags
+        # only actually-combed frames, decomb only touches those - safe to
+        # apply even if a handful of frames in an otherwise-interlaced source
+        # are progressive.
+        args += ["--comb-detect=default", "--decomb=default"]
     if preset_import:
         args += ["--preset-import-file", preset_import]
     args += extra_args
@@ -384,13 +453,16 @@ def process_file(src: Path, args, encoders: list[str], manifest: Manifest,
     name_hash = hashlib.sha1(str(src).encode("utf-8")).hexdigest()[:12]
     dst = tmp_dir / f"{name_hash}_{src.name}"
     dst.unlink(missing_ok=True)
+    mode = getattr(args, "interlace_mode", "auto")
+    deinterlace = resolve_interlaced(src, info, mode) if info else (mode == "force")
     manifest.set_status(str(src), size, "encoding", encoder=encoder)
-    log.info("ENCODE [%s] %s (%.2f GiB)", encoder, src, size / GiB)
+    log.info("ENCODE [%s]%s %s (%.2f GiB)", encoder,
+             " [interlaced: decomb enabled]" if deinterlace else "", src, size / GiB)
     t0 = time.time()
     try:
         handbrake_encode(src, dst, encoder, args.quality, args.preset,
                          args.extra_arg or [], args.handbrake_cli,
-                         args.timeout)
+                         args.timeout, deinterlace=deinterlace)
     except Exception as exc:  # noqa: BLE001 - any encode failure must not kill the batch
         dst.unlink(missing_ok=True)
         log.error("FAIL (encode) %s: %s", src, exc)
@@ -477,7 +549,10 @@ def cmd_run(args) -> int:
                 continue
             est = size * est_ratio
             total += size
+            interlaced = resolve_interlaced(p, info, args.interlace_mode) if info \
+                else (args.interlace_mode == "force")
             print(f"  {p}  [{size / GiB:.2f} GiB, codec={codec}, "
+                  f"interlaced={'yes' if interlaced else 'no'}, "
                   f"est. out ~{est / GiB:.2f} GiB]")
         print(f"\nTotal input: {total / GiB:.2f} GiB | "
               f"Rough est. output: {total * est_ratio / GiB:.2f} GiB "
@@ -571,6 +646,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="compress-library",
         description="H.265 media library compressor (HandBrakeCLI + ffprobe, "
                     "dual-GPU: qsv_h265 GPU0 / nvenc_h265 GPU1)")
+    p.add_argument("--version", action="version", version=f"compress-library {__version__}")
     sub = p.add_subparsers(dest="command")
 
     run = sub.add_parser("run", help="encode a library (default command)")
@@ -597,6 +673,12 @@ def build_parser() -> argparse.ArgumentParser:
                      help="SSD temp dir for encodes (default ./temp)")
     run.add_argument("--duration-tolerance", type=float, default=2.0,
                      help="max duration drift in seconds (default 2)")
+    run.add_argument("--interlace-mode", choices=["auto", "force", "off"], default="auto",
+                     help="deinterlacing: auto detects interlaced sources (field_order, "
+                          "or an ffmpeg idet sample for vc1/mpeg2/mpeg1 codecs whose "
+                          "field_order is unreliable) and enables HandBrake's adaptive "
+                          "--comb-detect/--decomb; force always enables it; off never does "
+                          "(default auto)")
     run.add_argument("--timeout", type=int, default=6 * 3600,
                      help="per-file encode timeout, seconds (default 21600)")
     run.add_argument("--manifest", default=str(DEFAULT_MANIFEST),
@@ -631,7 +713,7 @@ def setup_logging(logfile: str):
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Allow `compress-library <root> ...` without the literal `run` subcommand.
-    if argv and argv[0] not in ("run", "preflight", "-h", "--help"):
+    if argv and argv[0] not in ("run", "preflight", "-h", "--help", "--version"):
         argv.insert(0, "run")
     parser = build_parser()
     args = parser.parse_args(argv)

@@ -74,11 +74,11 @@ above. Features:
 
 - **Library / Options** — root folder picker, min size, quality (RF),
   encoder checkboxes (QSV/NVENC), GPU assign, temp dir, duration tolerance,
-  timeout, manifest/log/config paths, preset file, extra HandBrakeCLI args,
-  resume toggle.
+  interlace mode (auto/force/off), timeout, manifest/log/config paths,
+  preset file, extra HandBrakeCLI args, resume toggle.
 - **Preflight** — runs `compress_library.py preflight` and streams the result.
 - **Dry Run** — runs `--dry-run` and renders candidates into a sortable table
-  (size, codec, estimated output) instead of raw text.
+  (size, codec, interlaced, estimated output) instead of raw text.
 - **Start / Stop** — runs a real batch; Stop kills the whole process tree
   (via `psutil`, if installed) so an in-flight HandBrakeCLI child doesn't
   survive as an orphan.
@@ -87,6 +87,15 @@ above. Features:
   attempts/error per file; auto-refreshes while a batch runs.
 - **Config tab** — view/edit `config.json` (`estimate_ratio`,
   `encoder_blacklist`) and save it back.
+- **Help → Check for Updates…** — compares your local `compress_library.py`
+  `__version__` against `main` on GitHub (also checked silently ~2s after
+  launch). If a newer version exists, it offers to download and install it:
+  both `compress_library.py` and `gui.py` are backed up to
+  `<name>.bak-<timestamp>` next to the originals, the new versions are
+  written atomically, and you're offered an immediate restart (re-execs the
+  GUI process) to pick them up. Requires outbound HTTPS to
+  `raw.githubusercontent.com`; fails quietly on the silent startup check,
+  shows an error dialog if triggered manually.
 
 ## Usage
 
@@ -115,10 +124,36 @@ without typing `run`.
 | `--extra-arg` | — | Repeatable raw HandBrakeCLI args, e.g. `--extra-arg=--encopts=tune=ssim`. |
 | `--temp-dir` | `./temp` | SSD scratch dir for encodes. Must have free space ≥ your largest file. |
 | `--duration-tolerance` | `2` | Max allowed duration drift between input and output, seconds. |
+| `--interlace-mode` | `auto` | `auto` detects interlaced sources and enables HandBrake's adaptive `--comb-detect`/`--decomb`; `force` always enables it; `off` never does. See [Interlaced sources](#interlaced-sources) below. |
 | `--timeout` | `21600` | Per-file encode timeout (seconds). Kills runaway encodes. |
 | `--manifest` | `./manifest.db` | SQLite manifest for resume. |
 | `--log` | `./compress-library.log` | Log file — every file, encoder, sizes, ratio, status. |
 | `--no-resume` | — | Re-encode files already marked done. |
+
+## Interlaced sources
+
+Older Blu-ray/WEB rips using VC-1 or MPEG-2 (`Rush Hour 3`, `The Mummy`
+trilogy-style remuxes, etc.) are frequently interlaced, and their ffprobe
+`field_order` metadata is often missing/`unknown` even when the source
+genuinely is. Encoding an interlaced source without deinterlacing bakes in
+combing artifacts.
+
+With `--interlace-mode auto` (the default):
+1. Explicit `field_order` (`tt`/`bb`/`tb`/`bt`) is trusted directly — no extra cost.
+2. If `field_order` is `unknown`/missing **and** the codec is `vc1`,
+   `mpeg2video`, or `mpeg1video` (the codecs known to under-report it), a
+   short ffmpeg `idet` sample (100 frames) is decoded to get a real answer.
+3. Everything else is assumed progressive (matches the vast majority of
+   H.264/H.265 BluRay/WEB rips, and keeps scanning fast).
+
+When a file is flagged interlaced, HandBrakeCLI gets
+`--comb-detect=default --decomb=default` — HandBrake's adaptive filter,
+which only touches frames it actually detects as combed, so it's safe even
+if the interlace call is a false positive on a handful of frames.
+
+`--dry-run` shows the verdict per file (`interlaced=yes|no`) so you can
+review before committing to a batch. Use `--interlace-mode off` to disable
+detection entirely (old behavior), or `force` to always deinterlace.
 
 ## Config (`config.json`, optional)
 
