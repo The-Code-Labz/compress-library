@@ -243,10 +243,23 @@ Copy `config.example.json` → `config.json` in the tool dir.
   simultaneously `encoding` with the same `Encoder` value. Each encoder now
   gets its own dedicated worker thread processing only its own
   pre-partitioned file list, so this can no longer happen.
-- **HandBrakeCLI stderr is now captured on failure** (previously discarded to
-  `DEVNULL`). Encode failures log the last ~20 lines of HandBrakeCLI's actual
-  stderr output alongside the exit code, instead of just
-  `HandBrakeCLI exited with code N`.
+- **HandBrakeCLI's own output is now captured** (previously discarded to
+  `DEVNULL`). Encode failures log the last ~20 lines of its actual output
+  alongside the exit code, instead of just `HandBrakeCLI exited with code N`.
+- **Fixed (v1.4.0): the log looked dead for the entire duration of an encode.**
+  `handbrake_encode()` used to block on `subprocess.communicate()` with
+  stdout thrown away, so nothing appeared between a file's `ENCODE ...` line
+  and its eventual completion/failure — for a large remux that's 20-40+
+  minutes of apparent silence in both the CLI and the GUI's Log tab.
+  HandBrakeCLI's own progress line
+  (`Encoding: task 1 of 1, 34.56 % (123.45 fps, avg 100.00 fps, ETA 00h05m23s)`)
+  updates in place with a bare `\r`, not `\n`, which is also why a naive
+  line-buffered reader wouldn't have picked it up anyway. Output is now
+  streamed live on a reader thread that splits on either `\r` or `\n`, and
+  every whole-percent change is re-logged as
+  `PROGRESS [encoder] filename: NN.N% (avg X fps, ETA HHhMMmSSs)` — both the
+  CLI and the GUI's existing live log tail pick these up automatically, no
+  GUI changes needed.
 - **Audio is passthrough by default** — `--aencoder copy`. Some exotic audio
   (TrueHD, DTS:X) falls back to `ffac3` per `--audio-fallback`; that's by design.
 - **`.avi` / `.ts` sources** keep their exact original filename (per spec) but

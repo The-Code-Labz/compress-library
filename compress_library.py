@@ -32,7 +32,7 @@ try:
 except ImportError:  # pragma: no cover
     psutil = None
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 HEVC_CODEC_NAMES = {"hevc"}          # ffprobe codec_name values meaning "already H.265"
@@ -321,10 +321,63 @@ def set_low_priority(proc: subprocess.Popen):
         pass  # priority is best-effort; never fail an encode over it
 
 
+# HandBrakeCLI writes its per-file progress as a repeatedly-overwritten line
+# ("Encoding: task 1 of 1, 34.56 % (123.45 fps, avg 100.00 fps, ETA 00h05m23s)")
+# using a bare \r, not \n - a plain `for line in proc.stdout` (line-buffered on
+# \n) never sees it, which is why the GUI/CLI log looked dead for the entire
+# multi-minute duration of a single encode.
+_HB_PROGRESS_RE = re.compile(
+    r"Encoding: task \d+ of \d+, (\d+(?:\.\d+)?)\s*%"
+    r"(?:\s*\(([\d.]+) fps, avg ([\d.]+) fps, ETA ([0-9hms]+)\))?"
+)
+
+
+def _pump_handbrake_output(proc: subprocess.Popen, tail: list[str],
+                           progress_cb) -> None:
+    """Read HandBrakeCLI's merged stdout/stderr live, splitting on \\r or \\n
+    so in-place progress updates are seen as they happen. Keeps a rolling
+    tail of raw lines (for failure diagnostics) and forwards parsed
+    percentages to progress_cb, throttled to whole-percent steps."""
+    buf = ""
+    last_pct = -1.0
+    try:
+        while True:
+            chunk = proc.stdout.read(256)
+            if not chunk:
+                break
+            buf += chunk
+            while True:
+                cr, nl = buf.find("\r"), buf.find("\n")
+                candidates = [i for i in (cr, nl) if i != -1]
+                if not candidates:
+                    break
+                idx = min(candidates)
+                line, buf = buf[:idx].strip(), buf[idx + 1:]
+                if not line:
+                    continue
+                tail.append(line)
+                del tail[:-40]
+                m = _HB_PROGRESS_RE.search(line)
+                if m and progress_cb:
+                    pct = float(m.group(1))
+                    if pct - last_pct >= 1.0 or pct >= 100.0:
+                        last_pct = pct
+                        fps = m.group(3) or "?"
+                        eta = m.group(4) or "?"
+                        progress_cb(f"{pct:.1f}% (avg {fps} fps, ETA {eta})")
+    except (ValueError, OSError):
+        pass  # pipe closed under us (process killed on timeout) - not fatal
+    finally:
+        line = buf.strip()
+        if line:
+            tail.append(line)
+            del tail[:-40]
+
+
 def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
                      preset_import: str | None, extra_args: list[str],
                      hb_bin: str, timeout: int, deinterlace: bool = False,
-                     gpu_index: int | None = None) -> None:
+                     gpu_index: int | None = None, progress_cb=None) -> None:
     args = [
         hb_bin,
         "-i", str(src),
@@ -368,25 +421,30 @@ def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
     args += extra_args
 
     log.debug("HandBrakeCLI: %s", " ".join(args))
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.PIPE, text=True,
-                            errors="replace")
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True,
+                            errors="replace", bufsize=1)
     set_low_priority(proc)
+    tail: list[str] = []
+    reader = threading.Thread(target=_pump_handbrake_output,
+                              args=(proc, tail, progress_cb), daemon=True)
+    reader.start()
     try:
-        _, stderr_out = proc.communicate(timeout=timeout)
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.communicate()
+        proc.wait()
+        reader.join(timeout=5)
         raise RuntimeError(f"encode timed out after {timeout}s")
+    reader.join(timeout=10)
     if proc.returncode != 0:
         # HandBrakeCLI's real diagnostic (encoder init failure, invalid
-        # --encopts value, missing codec, etc.) is on stderr - surface the
-        # tail of it instead of just the exit code, which is otherwise
+        # --encopts value, missing codec, etc.) is in its own output - surface
+        # the tail of it instead of just the exit code, which is otherwise
         # useless for diagnosing e.g. an out-of-range --encopts gpu=N.
-        tail = "\n".join(stderr_out.strip().splitlines()[-20:]) if stderr_out else ""
         msg = f"HandBrakeCLI exited with code {proc.returncode}"
         if tail:
-            msg += f"\n{tail}"
+            msg += "\n" + "\n".join(tail[-20:])
         raise RuntimeError(msg)
 
 
@@ -493,11 +551,15 @@ def process_file(src: Path, args, encoder: str, manifest: Manifest,
              f" adapter={gpu_index}" if gpu_index is not None else "",
              " [interlaced: decomb enabled]" if deinterlace else "", src, size / GiB)
     t0 = time.time()
+
+    def _progress_cb(msg: str, _name=src.name, _enc=encoder) -> None:
+        log.info("PROGRESS [%s] %s: %s", _enc, _name, msg)
+
     try:
         handbrake_encode(src, dst, encoder, args.quality, args.preset,
                          args.extra_arg or [], args.handbrake_cli,
                          args.timeout, deinterlace=deinterlace,
-                         gpu_index=gpu_index)
+                         gpu_index=gpu_index, progress_cb=_progress_cb)
     except Exception as exc:  # noqa: BLE001 - any encode failure must not kill the batch
         dst.unlink(missing_ok=True)
         log.error("FAIL (encode) %s: %s", src, exc)
