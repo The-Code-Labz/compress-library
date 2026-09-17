@@ -25,7 +25,6 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 try:
@@ -33,7 +32,7 @@ try:
 except ImportError:  # pragma: no cover
     psutil = None
 
-__version__ = "1.1.1"
+__version__ = "1.2.1"
 
 VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 HEVC_CODEC_NAMES = {"hevc"}          # ffprobe codec_name values meaning "already H.265"
@@ -348,26 +347,47 @@ def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
         # are progressive.
         args += ["--comb-detect=default", "--decomb=default"]
     if gpu_index is not None:
-        # Pins the actual encode adapter. Placed before extra_args so a
-        # user-supplied --encopts in extra_arg still wins (HandBrakeCLI uses
-        # the last occurrence of a repeated option).
-        args += ["--encopts", f"gpu={gpu_index}"]
+        # Pins the actual encode adapter. NVENC and QSV use two completely
+        # different mechanisms in HandBrakeCLI - they are NOT interchangeable:
+        #   - nvenc_h265: "gpu=N" is a private --encopts key forwarded to
+        #     ffmpeg's h265_nvenc, where N is a CUDA device index.
+        #   - qsv_h265: adapter selection is a *top-level* CLI flag,
+        #     --qsv-adapter=N (oneVPL adapter index) - it is NOT an --encopts
+        #     key. Passing "--encopts gpu=N" to qsv_h265 is a silent no-op:
+        #     QSV has no "gpu" encopt, so it keeps using its own default
+        #     (the adapter with the highest hardware generation), which is
+        #     NOT guaranteed to be the adapter you asked for.
+        # Placed before extra_args so a user override still wins
+        # (HandBrakeCLI uses the last occurrence of a repeated option).
+        if encoder.startswith("nvenc"):
+            args += ["--encopts", f"gpu={gpu_index}"]
+        elif encoder.startswith("qsv"):
+            args += ["--qsv-adapter", str(gpu_index)]
     if preset_import:
         args += ["--preset-import-file", preset_import]
     args += extra_args
 
     log.debug("HandBrakeCLI: %s", " ".join(args))
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL)
+                            stderr=subprocess.PIPE, text=True,
+                            errors="replace")
     set_low_priority(proc)
     try:
-        rc = proc.wait(timeout=timeout)
+        _, stderr_out = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.wait()
+        proc.communicate()
         raise RuntimeError(f"encode timed out after {timeout}s")
-    if rc != 0:
-        raise RuntimeError(f"HandBrakeCLI exited with code {rc}")
+    if proc.returncode != 0:
+        # HandBrakeCLI's real diagnostic (encoder init failure, invalid
+        # --encopts value, missing codec, etc.) is on stderr - surface the
+        # tail of it instead of just the exit code, which is otherwise
+        # useless for diagnosing e.g. an out-of-range --encopts gpu=N.
+        tail = "\n".join(stderr_out.strip().splitlines()[-20:]) if stderr_out else ""
+        msg = f"HandBrakeCLI exited with code {proc.returncode}"
+        if tail:
+            msg += f"\n{tail}"
+        raise RuntimeError(msg)
 
 
 def verify(src: Path, dst: Path, tolerance: float) -> list[str]:
@@ -433,11 +453,8 @@ def scan(root: Path, min_bytes: int, manifest: Manifest, resume: bool,
     return candidates
 
 
-def process_file(src: Path, args, encoders: list[str], manifest: Manifest,
-                 worker_idx: int, gpu_assign: list[int] | None = None) -> str:
-    slot = worker_idx % len(encoders)
-    encoder = encoders[slot]
-    gpu_index = gpu_assign[slot] if gpu_assign and slot < len(gpu_assign) else None
+def process_file(src: Path, args, encoder: str, manifest: Manifest,
+                 gpu_index: int | None = None) -> str:
     size = src.stat().st_size
 
     # 1. Locked by Plex/Jellyfin/etc?
@@ -465,7 +482,7 @@ def process_file(src: Path, args, encoders: list[str], manifest: Manifest,
     deinterlace = resolve_interlaced(src, info, mode) if info else (mode == "force")
     manifest.set_status(str(src), size, "encoding", encoder=encoder)
     log.info("ENCODE [%s%s]%s %s (%.2f GiB)", encoder,
-             f" gpu={gpu_index}" if gpu_index is not None else "",
+             f" adapter={gpu_index}" if gpu_index is not None else "",
              " [interlaced: decomb enabled]" if deinterlace else "", src, size / GiB)
     t0 = time.time()
     try:
@@ -526,7 +543,7 @@ def cmd_run(args) -> int:
     if len(gpu_assign) != len(encoders):
         log.warning("--gpu-assign has %d entries for %d encoders; "
                     "extra/missing entries are ignored, unmapped encoders "
-                    "get no --encopts gpu= pin (see README)",
+                    "get no adapter pin (see README)",
                     len(gpu_assign), len(encoders))
     encoder_blacklist: dict[str, list[str]] = cfg.get("encoder_blacklist", {})
     est_ratio = float(cfg.get("estimate_ratio", 0.45))
@@ -575,15 +592,36 @@ def cmd_run(args) -> int:
         return 0
 
     stats = {"done": 0, "failed": 0, "locked": 0, "skipped-hevc": 0}
-    with ThreadPoolExecutor(max_workers=len(encoders),
-                            thread_name_prefix="encoder") as pool:
-        futures = {
-            pool.submit(process_file, p, args, encoders, manifest, i, gpu_assign): p
-            for i, p in enumerate(candidates)
-        }
-        for fut in as_completed(futures):
-            result = fut.result()
-            stats[result] = stats.get(result, 0) + 1
+    stats_lock = threading.Lock()
+
+    # Partition candidates into one fixed lane per encoder up front, then run
+    # each lane on its own dedicated thread. A shared ThreadPoolExecutor fed
+    # index-parity-tagged jobs (the old approach) breaks the encoder/GPU
+    # binding as soon as one lane finishes or fails faster than the other:
+    # the freed worker just pulls the next queued job regardless of which
+    # slot it was tagged for, so both threads can end up running the SAME
+    # encoder (e.g. two qsv_h265 jobs stacked on one GPU while the nvenc lane
+    # sits idle). Dedicated per-lane threads guarantee each encoder/GPU only
+    # ever processes its own queue, one file at a time, matching the log.
+    lanes: list[list[Path]] = [[] for _ in encoders]
+    for i, p in enumerate(candidates):
+        lanes[i % len(encoders)].append(p)
+
+    def run_lane(lane_files: list[Path], encoder: str, gpu_index: int | None):
+        for p in lane_files:
+            result = process_file(p, args, encoder, manifest, gpu_index)
+            with stats_lock:
+                stats[result] = stats.get(result, 0) + 1
+
+    threads = []
+    for slot, encoder in enumerate(encoders):
+        gpu_index = gpu_assign[slot] if gpu_assign and slot < len(gpu_assign) else None
+        t = threading.Thread(target=run_lane, args=(lanes[slot], encoder, gpu_index),
+                             name=f"encoder-{slot}-{encoder}", daemon=False)
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join()
 
     manifest.close()
     log.info("Batch complete: %s", ", ".join(f"{k}={v}" for k, v in sorted(stats.items())))
@@ -673,8 +711,12 @@ def build_parser() -> argparse.ArgumentParser:
                      default=["qsv_h265", "nvenc_h265"],
                      help="encoder(s); pass both for one-encode-per-GPU (default both)")
     run.add_argument("--gpu-assign", default="0,1",
-                     help="GPU adapter index per encoder, comma list (default 0,1); "
-                          "sent as --encopts gpu=N per matching --encoder slot")
+                     help="adapter index per encoder, comma list (default 0,1); "
+                          "for nvenc_h265 this is a CUDA device index sent as "
+                          "--encopts gpu=N (only 0 is valid on a single-NVIDIA-GPU "
+                          "box); for qsv_h265 this is a oneVPL adapter index sent "
+                          "as --qsv-adapter=N (0 = HandBrake's own default, "
+                          "the highest hardware-generation Intel GPU present)")
     run.add_argument("--preset", metavar="FILE",
                      help="HandBrake preset JSON to import (--preset-import-file)")
     run.add_argument("--extra-arg", action="append",

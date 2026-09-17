@@ -119,7 +119,7 @@ without typing `run`.
 | `--min-size` | `2` | Skip files smaller than this many GB. |
 | `--quality` | `25` | HandBrake RF constant quality. Lower = better/bigger. 20–28 is the useful range. |
 | `--encoder` | both | `qsv_h265` and/or `nvenc_h265`. Passing both runs one encode per GPU. |
-| `--gpu-assign` | `0,1` | Per-encoder GPU adapter index, forwarded to HandBrakeCLI as `--encopts gpu=N` on that encoder's jobs. See [Finding your GPU index](#finding-your-gpu-index) and caveats below. |
+| `--gpu-assign` | `0,1` | Per-encoder adapter index. For `nvenc_h265` this is a CUDA device index sent as `--encopts gpu=N`; for `qsv_h265` this is a oneVPL adapter index sent as the top-level `--qsv-adapter=N` flag (they are two different mechanisms — see [Finding your GPU index](#finding-your-gpu-index) and caveats below). |
 | `--preset` | — | HandBrake preset JSON (`--preset-import-file`). CLI flags still override the preset. |
 | `--extra-arg` | — | Repeatable raw HandBrakeCLI args, e.g. `--extra-arg=--encopts=tune=ssim`. |
 | `--temp-dir` | `./temp` | SSD scratch dir for encodes. Must have free space ≥ your largest file. |
@@ -158,28 +158,42 @@ detection entirely (old behavior), or `force` to always deinterlace.
 ## Finding your GPU index
 
 `--gpu-assign` indexes are **not** the order Windows/Device Manager/preflight
-list adapters in — they're Intel's oneVPL child-device index (for QSV) and
-CUDA's device order (for NVENC), which HandBrakeCLI passes straight through
-via `--encopts gpu=N`. There's no single command that maps "adapter #3 in
-Device Manager" to "gpu=N" ahead of time, so find it empirically:
+list adapters in, and QSV and NVENC do **not** share the mechanism:
+
+- `nvenc_h265` → CUDA device index, sent as the `--encopts gpu=N` private
+  encoder option. Only meaningful across your NVIDIA GPUs. On a box with a
+  single NVIDIA GPU the only valid value is `0` — anything else fails fast
+  with `HandBrakeCLI exited with code 3`.
+- `qsv_h265` → Intel oneVPL adapter index, sent as the **top-level**
+  `--qsv-adapter=N` CLI flag (not an `--encopts` key at all — HandBrake has
+  no `gpu=` encopt for QSV; a version before v1.2.1 wrongly sent
+  `--encopts gpu=N` here, which QSV silently ignored). HandBrake's own
+  default with no `--qsv-adapter` given is **the Intel adapter with the
+  highest hardware generation** — on a system with an Arc + UHD iGPU, that
+  should already prefer Arc without any flag at all.
+
+There's no single command that maps "adapter #3 in Device Manager" to
+`--gpu-assign`'s index ahead of time, so confirm empirically:
 
 1. Run `compress-library preflight` — it lists every GPU Windows sees, in
    Device Manager order, purely for identification (this list is **not**
    the index order).
 2. Start a real encode (`compress-library-gui` → Start, or `run` without
-   `--dry-run`) with your current guess, e.g. `--gpu-assign 0,1`.
-3. Open Task Manager → Performance tab → select each GPU tile → watch the
-   **Video Encode** engine graph (not "3D" or "Copy") for each one while the
-   job runs. Whichever GPU's Video Encode graph spikes is the one that index
-   actually mapped to.
+   `--dry-run`) with your current guess, e.g. `--gpu-assign 0,0` (`0` is the
+   only valid NVENC value on a single-NVIDIA box).
+3. Open Task Manager → Performance tab → click each GPU tile, then
+   right-click one of its 4 mini-graphs and pick **Video Encode** —
+   the tile's headline % is whatever engine it's set to show (often "3D"
+   by default), so an idle-looking GPU may just be showing the wrong
+   engine, not actually be idle. Watch the Video Encode graph specifically
+   for the QSV GPU and the NVENC GPU while the job runs.
 4. If QSV (`qsv_h265`) lit up the wrong Intel adapter (e.g. UHD 770 instead
-   of Arc), or NVENC landed on the wrong card, flip the corresponding number
-   — e.g. try `--gpu-assign 1,0`, or `2,0` if you have more than two GPUs on
-   that vendor's side — and re-test. Indexes are usually small integers
-   starting at 0 per-vendor, not a shared global list across QSV+NVENC.
-5. `--log` / the Log tab also shows `ENCODE [qsv_h265 gpu=1] ...` per file so
-   you can confirm which index was actually sent, without guessing from the
-   command line.
+   of Arc), try an explicit `--qsv-adapter` value via `--gpu-assign` (e.g.
+   `1,0`) and re-test. Indexes are small integers starting at 0 per-vendor,
+   not a shared global list across QSV+NVENC.
+5. `--log` / the Log tab also shows `ENCODE [qsv_h265 adapter=1] ...` per
+   file so you can confirm which index was actually sent, without guessing
+   from the command line.
 
 Once you find the pair that lights up the correct adapters, it's stable for
 that machine — no need to re-check on future runs unless you change hardware
@@ -196,17 +210,41 @@ Copy `config.example.json` → `config.json` in the tool dir.
 
 ## Caveats worth knowing
 
-- **GPU adapter pinning is enforced via `--encopts gpu=N`**, one entry of
-  `--gpu-assign` per `--encoder` slot (round-robin: worker N gets
-  `encoders[N % len(encoders)]` and `gpu_assign[N % len(encoders)]` — they
-  always pair up). If you supply your own conflicting `--encopts` via
-  `--extra-arg`, yours wins (HandBrakeCLI honors the last occurrence of a
-  repeated option). See [Finding your GPU index](#finding-your-gpu-index) to
-  determine which number maps to which physical card on your box — the
-  preflight adapter list is Device Manager order, not the `gpu=` index.
-  NVENC has a known upstream driver quirk (HandBrake #7308) where some driver
-  versions ignore `gpu=` and always use GPU 0 — only relevant if you have
-  more than one NVIDIA GPU.
+- **GPU adapter pinning uses two different HandBrakeCLI mechanisms**, one
+  entry of `--gpu-assign` per `--encoder` slot (candidates are split into a
+  fixed lane per encoder up front — `encoders[N % len(encoders)]` gets every
+  Nth file — and each lane runs on its own dedicated thread bound to
+  `gpu_assign[N % len(encoders)]` for its entire run): `nvenc_h265` gets
+  `--encopts gpu=N`, `qsv_h265` gets the top-level `--qsv-adapter=N` flag.
+  **Fixed in v1.2.1**: earlier versions sent `--encopts gpu=N` to `qsv_h265`
+  too — QSV has no such encopt, so it was a silent no-op and QSV always fell
+  back to HandBrake's own default adapter (the highest hardware-generation
+  Intel GPU) regardless of what `--gpu-assign` said. If you supply your own
+  conflicting `--encopts`/`--qsv-adapter` via `--extra-arg`, yours wins
+  (HandBrakeCLI honors the last occurrence of a repeated option). See
+  [Finding your GPU index](#finding-your-gpu-index) to determine which number
+  maps to which physical card on your box — the preflight adapter list is
+  Device Manager order, not the oneVPL/CUDA index. NVENC also has a known
+  upstream driver quirk (HandBrake #7308) where some driver versions ignore
+  `gpu=` and always use GPU 0 — only relevant if you have more than one
+  NVIDIA GPU. The NVENC index is a **CUDA device index over NVIDIA GPUs
+  only** (not a shared global adapter list with QSV) — on a box with a single
+  NVIDIA GPU, the only valid value for the `nvenc_h265` slot is `0`; anything
+  else fails fast with `HandBrakeCLI exited with code 3`.
+- **Fixed (v1.2.0): encoder/GPU lanes could cross-contaminate.** Earlier
+  versions queued every candidate into one shared thread pool tagged by list
+  index; if one lane's jobs failed or finished faster than the other, the
+  freed worker thread would grab the next queued file regardless of which
+  encoder it was tagged for — so both threads could end up running the
+  *same* encoder concurrently (e.g. two `qsv_h265` jobs stacked on one GPU)
+  while the other lane sat idle, visible in the GUI's queue table as two rows
+  simultaneously `encoding` with the same `Encoder` value. Each encoder now
+  gets its own dedicated worker thread processing only its own
+  pre-partitioned file list, so this can no longer happen.
+- **HandBrakeCLI stderr is now captured on failure** (previously discarded to
+  `DEVNULL`). Encode failures log the last ~20 lines of HandBrakeCLI's actual
+  stderr output alongside the exit code, instead of just
+  `HandBrakeCLI exited with code N`.
 - **Audio is passthrough by default** — `--aencoder copy`. Some exotic audio
   (TrueHD, DTS:X) falls back to `ffac3` per `--audio-fallback`; that's by design.
 - **`.avi` / `.ts` sources** keep their exact original filename (per spec) but
