@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "compress-library"
+version = "1.0.0"
+description = "H.265 media library compressor (dual-GPU HandBrakeCLI + ffprobe, verified atomic replace)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "psutil>=5.9",
+]
+
+[project.scripts]
+compress-library = "compress_library:main"
+compress-library-gui = "gui:main"
+
+[tool.setuptools]
+py-modules = ["compress_library", "gui"]

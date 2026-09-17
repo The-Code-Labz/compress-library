@@ -14,6 +14,7 @@ Safety model (non-negotiable):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -191,8 +192,10 @@ class Manifest:
 def is_locked(path: Path) -> bool:
     """Probe whether another process (Plex/Jellyfin/mpv) holds the file open.
 
-    Windows: an open-without-sharing file cannot be renamed; POSIX: fall back
-    to an exclusive-mode open.
+    Windows: an open-without-sharing file cannot be renamed. POSIX has no
+    mandatory-locking equivalent, so this is best-effort: try a non-blocking
+    advisory flock (works if the holder also uses flock, e.g. some players),
+    otherwise fall back to a plain open probe (catches permission issues only).
     """
     if os.name == "nt":
         try:
@@ -203,11 +206,21 @@ def is_locked(path: Path) -> bool:
         except OSError:
             return False
     try:
-        fd = os.open(path, os.O_RDWR | os.O_EXCL)
-        os.close(fd)
-        return False
-    except OSError:
-        return True
+        import fcntl
+        with open(path, "rb") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(f, fcntl.LOCK_UN)
+                return False
+            except OSError:
+                return True
+    except (ImportError, OSError):
+        try:
+            fd = os.open(path, os.O_RDWR)
+            os.close(fd)
+            return False
+        except OSError:
+            return True
 
 
 def atomic_replace(src_tmp: Path, original: Path):
@@ -312,7 +325,7 @@ def verify(src: Path, dst: Path, tolerance: float) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def scan(root: Path, min_bytes: int, manifest: Manifest, resume: bool,
-         encoder_blacklist: dict[str, list[str]]) -> list[Path]:
+         encoder_blacklist: dict[str, list[str]], encoders: list[str]) -> list[Path]:
     """Find encode candidates. Returns sorted list of absolute paths."""
     candidates: list[Path] = []
     skipped_done = 0
@@ -328,7 +341,11 @@ def scan(root: Path, min_bytes: int, manifest: Manifest, resume: bool,
             if size < min_bytes:
                 continue
             ext_blacklist = encoder_blacklist.get(p.suffix.lower(), [])
-            if ext_blacklist and all(e in ext_blacklist for e in ("qsv_h265", "nvenc_h265")):
+            # Skip only if every encoder actually selected for this run is
+            # blacklisted for this extension - not a hardcoded qsv/nvenc pair,
+            # otherwise a single-encoder run (--encoder nvenc_h265) would
+            # ignore a blacklist that names only that one encoder.
+            if ext_blacklist and all(e in ext_blacklist for e in encoders):
                 log.info("SKIP (extension blacklisted) %s", p)
                 continue
             rec = manifest.get(str(p))
@@ -359,10 +376,13 @@ def process_file(src: Path, args, encoders: list[str], manifest: Manifest,
         manifest.set_status(str(src), size, "skipped-hevc")
         return "skipped-hevc"
 
-    # 3. Encode to temp dir
+    # 3. Encode to temp dir. Prefix with a hash of the full source path so two
+    # files that share a basename in different library folders (common with
+    # "S01E01.mkv" style naming) can never collide while encoding in parallel.
     tmp_dir: Path = Path(args.temp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    dst = tmp_dir / src.name  # EXACT original filename, in temp dir
+    name_hash = hashlib.sha1(str(src).encode("utf-8")).hexdigest()[:12]
+    dst = tmp_dir / f"{name_hash}_{src.name}"
     dst.unlink(missing_ok=True)
     manifest.set_status(str(src), size, "encoding", encoder=encoder)
     log.info("ENCODE [%s] %s (%.2f GiB)", encoder, src, size / GiB)
@@ -432,7 +452,8 @@ def cmd_run(args) -> int:
     manifest.reset_interrupted()  # crash/reboot recovery
 
     candidates = scan(root, int(args.min_size * GiB), manifest,
-                      resume=args.resume, encoder_blacklist=encoder_blacklist)
+                      resume=args.resume, encoder_blacklist=encoder_blacklist,
+                      encoders=encoders)
 
     if args.dry_run:
         total = 0
@@ -526,7 +547,7 @@ def cmd_preflight(_args) -> int:
     else:
         print("\n  (non-Windows host: skipping WMI GPU enumeration)")
 
-    tmp = Path("temp").resolve()
+    tmp = (TOOL_DIR / "temp").resolve()  # matches --temp-dir's default in `run`
     try:
         tmp.mkdir(parents=True, exist_ok=True)
         probe = tmp / ".preflight-write-test"
