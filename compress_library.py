@@ -32,7 +32,7 @@ try:
 except ImportError:  # pragma: no cover
     psutil = None
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 HEVC_CODEC_NAMES = {"hevc"}          # ffprobe codec_name values meaning "already H.265"

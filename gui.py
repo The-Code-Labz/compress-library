@@ -410,7 +410,7 @@ class CompressLibraryGUI:
         for line in self.txt_extra_args.get("1.0", "end").splitlines():
             line = line.strip()
             if line:
-                args += ["--extra-arg", line]
+                args.append(f"--extra-arg={line}")
         if not self.var_resume.get():
             args.append("--no-resume")
         return args

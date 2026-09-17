@@ -254,6 +254,14 @@ Copy `config.example.json` → `config.json` in the tool dir.
   fine; strict extension-sniffing setups may care.
 - **Verify failures keep the original.** If the output isn't smaller, or drops
   a track, the source stays put and the temp file is deleted.
+- **Fixed (v1.3.1): GUI's "Extra HandBrakeCLI args" field crashed the run/dry-run
+  before it started, whenever a line began with `--` (e.g. `--verbose=1`).** The
+  GUI built each extra arg as two separate argv tokens (`--extra-arg`, `line`);
+  argparse then read the `--`-prefixed value as a new flag instead of
+  `--extra-arg`'s argument, failing immediately with
+  `error: argument --extra-arg: expected one argument` (status bar showed
+  `exit=2`, no encoding activity). Fixed to emit one joined `--extra-arg=<line>`
+  token per line, matching the CLI's own required syntax.
 
 ## Resume / crash recovery
 
