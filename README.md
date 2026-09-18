@@ -259,6 +259,33 @@ Copy `config.example.json` → `config.json` in the tool dir.
 
 ## Caveats worth knowing
 
+- **Fixed (v1.7.0): `--all-subtitles` silently enabled HandBrake's "Foreign
+  Audio Search" on any source with a forced subtitle track, which looked
+  exactly like a hang.** Confirmed via a live `--verbose=1` trace on a
+  44-subtitle-track remux: the constructed job JSON showed
+  `Subtitle.Search.Enable: true` only when `--all-subtitles` was used, `false`
+  when subtitles were explicitly restricted. Foreign Audio Search is a full
+  *extra* decode-only pre-pass over the entire file to auto-pick a forced
+  track to burn in, inserted as "task 1 of 2" before the real encode even
+  starts. During that pre-pass HandBrake's `%` (bytes read) races ahead while
+  `avg fps` (frames actually finished) stays pinned at `0.00` for the whole
+  scan - on a multi-hour file this is indistinguishable from a genuine hang,
+  and it affected both QSV and NVENC identically (it has nothing to do with
+  either GPU). This is an upstream HandBrake issue: `--all-subtitles` is
+  *documented* as unrelated to the `"scan"` pseudo-track that's supposed to be
+  the only Foreign Audio Search trigger
+  ([HandBrake/HandBrake#5731](https://github.com/HandBrake/HandBrake/issues/5731)),
+  and there's no clean CLI flag to force it back off once it's on
+  ([#7788](https://github.com/HandBrake/HandBrake/issues/7788)). Fixed by
+  never passing `--all-subtitles`/the literal `"scan"` value - instead every
+  real subtitle track is selected by its explicit 1-based index (`-s
+  "1,2,...,N"`), built from the same count `verify()` already gets via
+  `stream_info()`. Falls back to `--all-subtitles` only when subtitle count is
+  unknown (ffprobe couldn't read the file at all - the `unprobeable`-codec
+  edge case). If your runs previously appeared to hang forever at some
+  percentage with `avg fps` stuck at `0.00`, pull latest - that was this bug,
+  not your GPU/driver.
+
 - **Fixed (v1.6.1): `qsv_av1` was named `av1_qsv` in v1.6.0 - not a real
   HandBrakeCLI encoder.** Confirmed via a live `HandBrakeCLI --help`/trace on
   real hardware: HandBrake's QSV family is `qsv_<codec>` (`qsv_h264`,

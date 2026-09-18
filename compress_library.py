@@ -32,7 +32,7 @@ try:
 except ImportError:  # pragma: no cover
     psutil = None
 
-__version__ = "1.6.1"
+__version__ = "1.7.0"
 
 VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 HEVC_CODEC_NAMES = {"hevc"}          # ffprobe codec_name values meaning "already H.265"
@@ -420,7 +420,8 @@ def _pump_handbrake_output(proc: subprocess.Popen, tail: list[str],
 def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
                      preset_import: str | None, extra_args: list[str],
                      hb_bin: str, timeout: int, deinterlace: bool = False,
-                     gpu_index: int | None = None, progress_cb=None) -> None:
+                     gpu_index: int | None = None, progress_cb=None,
+                     subtitle_count: int | None = None) -> None:
     args = [
         hb_bin,
         "-i", str(src),
@@ -432,7 +433,30 @@ def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
         "--aencoder", "copy",
         "--audio-copy-mask", "aac,ac3,eac3,dts,dtshd,truehd,mp3,flac,opus",
         "--audio-fallback", "ffac3",
-        "--all-subtitles",
+    ]
+    # --all-subtitles silently enables HandBrake's "Foreign Audio Search" on
+    # any source with a forced subtitle track (confirmed via a live
+    # --verbose=1 trace: the constructed job JSON showed
+    # Subtitle.Search.Enable=true only when --all-subtitles was used, false
+    # when subtitles were explicitly restricted). Foreign Audio Search is a
+    # full extra decode-only pre-pass over the ENTIRE file to pick a forced
+    # track to burn in - on a multi-hour source this looks exactly like a
+    # hang: HandBrake's own progress % (bytes read) races ahead while avg fps
+    # (frames actually finished) stays pinned at 0.00 for the whole pre-pass,
+    # and no DONE/FAIL is logged until it finally completes. This is an
+    # upstream HandBrake bug (--all-subtitles is documented as unrelated to
+    # the "scan" pseudo-track that's supposed to be the only Foreign Audio
+    # Search trigger - see HandBrake/HandBrake#5731) with no clean CLI flag
+    # to force it back off once triggered (#7788). Fix: never pass the
+    # literal "scan"/--all-subtitles value - select every real subtitle
+    # track by its explicit 1-based index instead, which does not trigger
+    # the search. Falls back to --all-subtitles only when subtitle_count is
+    # unknown (stream_info()/ffprobe couldn't read the file at all).
+    if subtitle_count is None:
+        args.append("--all-subtitles")
+    elif subtitle_count > 0:
+        args += ["-s", ",".join(str(i) for i in range(1, subtitle_count + 1))]
+    args += [
         # --subtitle-burned takes an OPTIONAL argument (getopt_long style:
         # "[=number, \"native\", or \"none\"]"). Passing it as two separate
         # argv tokens ("--subtitle-burned", "none") does NOT bind "none" as
@@ -625,7 +649,8 @@ def process_file(src: Path, args, encoder: str, manifest: Manifest,
         handbrake_encode(src, dst, encoder, args.quality, args.preset,
                          args.extra_arg or [], args.handbrake_cli,
                          args.timeout, deinterlace=deinterlace,
-                         gpu_index=gpu_index, progress_cb=_progress_cb)
+                         gpu_index=gpu_index, progress_cb=_progress_cb,
+                         subtitle_count=(info["subtitles"] if info else None))
     except Exception as exc:  # noqa: BLE001 - any encode failure must not kill the batch
         dst.unlink(missing_ok=True)
         log.error("FAIL (encode) %s: %s", src, exc)
