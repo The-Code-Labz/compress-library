@@ -286,6 +286,21 @@ Copy `config.example.json` → `config.json` in the tool dir.
   percentage with `avg fps` stuck at `0.00`, pull latest - that was this bug,
   not your GPU/driver.
 
+- **Fixed (v1.7.1): non-interlaced sources still paid the full Comb
+  Detect + Decomb cost.** `--interlace-mode auto` correctly determines a
+  source isn't interlaced, but simply *not passing* `--comb-detect`/
+  `--decomb` does not disable them - the `Fast 1080p30` preset enables both
+  by default, so every progressive file still ran a full per-frame
+  comb-detect pass (and real decomb work on any falsely-flagged frames).
+  This was the single largest contributor to a real-world throughput gap
+  measured against bare `ffmpeg -hwaccel qsv ...` on the same file: 464 fps
+  raw vs. ~221-350 fps through this tool on a confirmed-progressive 2025
+  h264 source. Fixed by explicitly sending `--comb-detect=off --decomb=off`
+  whenever the source is not flagged interlaced, instead of omitting the
+  flags. Genuinely interlaced sources (VC-1/MPEG-2 titles, etc.) are
+  unaffected - they still get the adaptive `--comb-detect=default
+  --decomb=default` pair as before.
+
 - **Fixed (v1.6.1): `qsv_av1` was named `av1_qsv` in v1.6.0 - not a real
   HandBrakeCLI encoder.** Confirmed via a live `HandBrakeCLI --help`/trace on
   real hardware: HandBrake's QSV family is `qsv_<codec>` (`qsv_h264`,

@@ -32,7 +32,7 @@ try:
 except ImportError:  # pragma: no cover
     psutil = None
 
-__version__ = "1.7.0"
+__version__ = "1.7.1"
 
 VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 HEVC_CODEC_NAMES = {"hevc"}          # ffprobe codec_name values meaning "already H.265"
@@ -478,6 +478,20 @@ def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
         # apply even if a handful of frames in an otherwise-interlaced source
         # are progressive.
         args += ["--comb-detect=default", "--decomb=default"]
+    else:
+        # BUG (found live-tracing a "why is QSV so much slower than raw
+        # ffmpeg" report): simply omitting --comb-detect/--decomb does NOT
+        # disable them - the "Fast 1080p30" preset enables Comb Detect +
+        # Decomb by default, so every progressive source still paid for a
+        # full per-frame comb-detect pass (and real decomb work on any
+        # falsely-flagged frames) even when our own auto-detection correctly
+        # determined the source isn't interlaced. This was the single
+        # largest contributor to HandBrakeCLI's throughput gap vs. a bare
+        # `ffmpeg -hwaccel qsv ...` encode of the same file (measured
+        # 464fps raw vs ~221-350fps via this tool on a confirmed-progressive
+        # 2025 h264 source). Explicitly force both off for non-interlaced
+        # sources instead of relying on flag-absence.
+        args += ["--comb-detect=off", "--decomb=off"]
     if gpu_index is not None:
         # Pins the actual encode adapter. NVENC and QSV use two completely
         # different mechanisms in HandBrakeCLI - they are NOT interchangeable:
