@@ -7,7 +7,7 @@ a locked file, or a bad encode never costs you the source.
 
 **Target hardware ("Optimus"):**
 Windows 11 · i9-13900K · 128 GB RAM
-- GPU 0 — Intel Arc A580 (Quick Sync) → `qsv_h265` (or `av1_qsv`, see [AV1 on Arc](#av1-on-arc))
+- GPU 0 — Intel Arc A580 (Quick Sync) → `qsv_h265` (or `qsv_av1`, see [AV1 on Arc](#av1-on-arc))
 - GPU 1 — RTX 3070 (NVENC) → `nvenc_h265`
 
 Two encodes run in parallel, one per GPU, at below-normal process priority, so the
@@ -120,8 +120,8 @@ without typing `run`.
 | `--min-size` | `2` | Skip files smaller than this many GB. |
 | `--recompress-hevc-over` | `0` (off) | Re-encode already-HEVC/AV1 files whose size is ≥ this many GB, instead of always skipping them. Useful for oversized remuxes that were themselves encoded at a low RF and can still shrink further at this run's `--quality`. The existing verification gate still applies — if the re-encode doesn't come out smaller than the source, it fails verification and the original is left untouched. `0` (default) preserves the original "never touch an already-compressed file" behavior. |
 | `--quality` | `25` | HandBrake RF constant quality. Lower = better/bigger. 20–28 is the useful range for HEVC. AV1's RF scale is NOT equivalent to HEVC's — do not reuse the same value blind; test on a sample first. |
-| `--encoder` | both | `qsv_h265` and/or `nvenc_h265`, or `av1_qsv` in place of `qsv_h265`. See [AV1 on Arc](#av1-on-arc) below. |
-| `--gpu-assign` | `0,1` | Per-encoder adapter index. For `nvenc_h265` this is a CUDA device index sent as `--encopts gpu=N`; for `qsv_h265`/`av1_qsv` this is a oneVPL adapter index sent as the top-level `--qsv-adapter=N` flag (they are two different mechanisms — see [Finding your GPU index](#finding-your-gpu-index) and caveats below). |
+| `--encoder` | both | `qsv_h265` and/or `nvenc_h265`, or `qsv_av1` in place of `qsv_h265`. See [AV1 on Arc](#av1-on-arc) below. |
+| `--gpu-assign` | `0,1` | Per-encoder adapter index. For `nvenc_h265` this is a CUDA device index sent as `--encopts gpu=N`; for `qsv_h265`/`qsv_av1` this is a oneVPL adapter index sent as the top-level `--qsv-adapter=N` flag (they are two different mechanisms — see [Finding your GPU index](#finding-your-gpu-index) and caveats below). |
 | `--preset` | — | HandBrake preset JSON (`--preset-import-file`). CLI flags still override the preset. |
 | `--extra-arg` | — | Repeatable raw HandBrakeCLI args, e.g. `--extra-arg=--encopts=tune=ssim`. |
 | `--temp-dir` | `./temp` | SSD scratch dir for encodes. Must have free space ≥ your largest file. |
@@ -134,23 +134,23 @@ without typing `run`.
 
 ## AV1 on Arc
 
-`av1_qsv` uses Arc's dedicated AV1 hardware encode block instead of `qsv_h265`
+`qsv_av1` uses Arc's dedicated AV1 hardware encode block instead of `qsv_h265`
 on the QSV lane — pass it in place of `qsv_h265`, e.g.
-`--encoder av1_qsv nvenc_h265`.
+`--encoder qsv_av1 nvenc_h265`.
 
 **There is no NVENC AV1 encode on this hardware.** RTX 30-series (Ampere,
 8th-gen NVENC) has no AV1 encode silicon — that only shipped starting with
 Ada Lovelace (RTX 40-series). An RTX 3070 can hardware-*decode* AV1 fine but
 cannot encode it; `av1_nvenc` would fail identically to an out-of-range
 `--encopts gpu=N` (`No capable devices found`). So a mixed
-`av1_qsv` + `nvenc_h265` run is not a choice between two AV1 options — it's
+`qsv_av1` + `nvenc_h265` run is not a choice between two AV1 options — it's
 the only viable pairing if you want AV1 at all on this box; the NVENC lane
 stays HEVC.
 
 Before switching a whole library over:
 
 - **RF scale is not shared with HEVC.** `--quality 25` does not target the
-  same visual quality on `av1_qsv` as it does on `qsv_h265`/`nvenc_h265`.
+  same visual quality on `qsv_av1` as it does on `qsv_h265`/`nvenc_h265`.
   Test a value against a real sample and eyeball playback before committing
   a batch run.
 - **Playback/decode compatibility is the real risk, not encode speed.**
@@ -161,7 +161,7 @@ Before switching a whole library over:
   transcode session shows hardware, not software, decode) before
   converting a whole library.
 - **Already-AV1 files are now skip-detected** (`already_compressed()` /
-  `codec_label()` cover both HEVC and AV1) — a second run over `av1_qsv`
+  `codec_label()` cover both HEVC and AV1) — a second run over `qsv_av1`
   output correctly logs `SKIP (already AV1)` instead of re-encoding
   AV1→AV1 (lossy-on-lossy), the same protection HEVC always had.
 
@@ -259,16 +259,30 @@ Copy `config.example.json` → `config.json` in the tool dir.
 
 ## Caveats worth knowing
 
-- **Added (v1.6.0): `av1_qsv` encoder option (Arc AV1 hardware encode, in
+- **Fixed (v1.6.1): `qsv_av1` was named `av1_qsv` in v1.6.0 - not a real
+  HandBrakeCLI encoder.** Confirmed via a live `HandBrakeCLI --help`/trace on
+  real hardware: HandBrake's QSV family is `qsv_<codec>` (`qsv_h264`,
+  `qsv_h265`, `qsv_av1`) - only the *NVENC* family flips the order
+  (`hevc_nvenc`, `av1_nvenc`). `av1_qsv` doesn't exist, so every job failed
+  immediately with `ERROR: Invalid video encoder (av1_qsv)` - but
+  **HandBrakeCLI exits with code 0 even on this init failure**, so
+  `handbrake_encode()`'s `returncode != 0` check never caught it; the
+  pipeline fell through to `verify()`, which reported the missing output as
+  `FAIL (verify): output unreadable by ffprobe` instead of a clear encode
+  error. Renamed to the correct `qsv_av1` everywhere (CLI choice, GUI
+  checkbox/variable, docs). If you hit `qsv_av1`/`av1_qsv` confusion on an
+  older checkout, pull latest.
+
+- **Added (v1.6.0): `qsv_av1` encoder option (Arc AV1 hardware encode, in
   place of `qsv_h265`).** See [AV1 on Arc](#av1-on-arc) above for the full
   picture. Two things fixed alongside it, not just added: the GPU-index
   detection in `handbrake_encode()` matched on `encoder.startswith("qsv")`,
-  which is `False` for `"av1_qsv"` (starts with `"av1"`) - `--qsv-adapter`
+  which was `False` for the (then-misnamed) AV1 encoder id - `--qsv-adapter`
   would have silently gone unset for the AV1 lane. Changed to `"qsv" in
   encoder`. The "already compressed, skip" logic (`is_h265()` /
   `HEVC_CODEC_NAMES`) was also HEVC-only - generalized to
-  `already_compressed()` / `codec_label()` covering both HEVC and AV1, so an
-  `av1_qsv` output doesn't get silently re-encoded AV1→AV1 on the next run.
+  `already_compressed()` / `codec_label()` covering both HEVC and AV1, so
+  `qsv_av1` output doesn't get silently re-encoded AV1→AV1 on the next run.
 
 - **Fixed (v1.5.0): verify almost always failed with a false
   `subtitle tracks N < input N+1` on virtually every title.** Root cause

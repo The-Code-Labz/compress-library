@@ -220,7 +220,7 @@ class CompressLibraryGUI:
         self.var_quality = tk.DoubleVar(value=25.0)
         self.var_qsv = tk.BooleanVar(value=True)
         self.var_nvenc = tk.BooleanVar(value=True)
-        self.var_av1_qsv = tk.BooleanVar(value=False)
+        self.var_qsv_av1 = tk.BooleanVar(value=False)
         self.var_gpu_assign = tk.StringVar(value="0,1")
         self.var_temp_dir = tk.StringVar()
         self.var_duration_tol = tk.DoubleVar(value=2.0)
@@ -243,7 +243,7 @@ class CompressLibraryGUI:
         encf.grid(row=r, column=1, sticky="w")
         ttk.Checkbutton(encf, text="qsv_h265 (GPU0)", variable=self.var_qsv).pack(side="left")
         ttk.Checkbutton(encf, text="nvenc_h265 (GPU1)", variable=self.var_nvenc).pack(side="left", padx=(8, 0))
-        ttk.Checkbutton(encf, text="av1_qsv (Arc, replaces qsv_h265)", variable=self.var_av1_qsv).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(encf, text="qsv_av1 (Arc, replaces qsv_h265)", variable=self.var_qsv_av1).pack(side="left", padx=(8, 0))
         self._field(opts, r, 2, "GPU assign", ttk.Entry(opts, textvariable=self.var_gpu_assign, width=12))
         r += 1
         self._field_browse(opts, r, 0, "Temp dir", self.var_temp_dir, dir_only=True)
@@ -377,8 +377,8 @@ class CompressLibraryGUI:
             messagebox.showerror("compress-library", "Choose a valid library root directory first.")
             return None
         encoders = []
-        if self.var_av1_qsv.get():
-            encoders.append("av1_qsv")  # replaces qsv_h265 on the same QSV/Arc lane
+        if self.var_qsv_av1.get():
+            encoders.append("qsv_av1")  # replaces qsv_h265 on the same QSV/Arc lane
         elif self.var_qsv.get():
             encoders.append("qsv_h265")
         if self.var_nvenc.get():

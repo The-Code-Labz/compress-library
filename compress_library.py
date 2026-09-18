@@ -32,7 +32,7 @@ try:
 except ImportError:  # pragma: no cover
     psutil = None
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 HEVC_CODEC_NAMES = {"hevc"}          # ffprobe codec_name values meaning "already H.265"
@@ -469,7 +469,7 @@ def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
         # (HandBrakeCLI uses the last occurrence of a repeated option).
         if encoder.startswith("nvenc"):
             args += ["--encopts", f"gpu={gpu_index}"]
-        elif "qsv" in encoder:  # qsv_h265, av1_qsv - both are oneVPL/QSV adapters
+        elif "qsv" in encoder:  # qsv_h265, qsv_av1 - both are oneVPL/QSV adapters
             # --qsv-adapter is declared as a getopt_long OPTIONAL-argument
             # flag ("--qsv-adapter[=index]"), same family as
             # --subtitle-burned above which was CONFIRMED to silently drop
@@ -852,18 +852,18 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--quality", type=float, default=25.0,
                      help="HandBrake constant-quality RF (default 25)")
     run.add_argument("--encoder", nargs="+",
-                     choices=["qsv_h265", "nvenc_h265", "av1_qsv"],
+                     choices=["qsv_h265", "nvenc_h265", "qsv_av1"],
                      default=["qsv_h265", "nvenc_h265"],
                      help="encoder(s); pass both qsv_h265+nvenc_h265 for one-encode-per-GPU "
-                          "(default). av1_qsv uses Arc's AV1 hardware encode block instead of "
+                          "(default). qsv_av1 uses Arc's AV1 hardware encode block instead of "
                           "HEVC on the QSV lane (Arc-only; no consumer NVENC GPU can hardware-"
                           "encode AV1 as of Ada/40-series, so there is no av1_nvenc) - e.g. "
-                          "--encoder av1_qsv nvenc_h265")
+                          "--encoder qsv_av1 nvenc_h265")
     run.add_argument("--gpu-assign", default="0,1",
                      help="adapter index per encoder, comma list (default 0,1); "
                           "for nvenc_h265 this is a CUDA device index sent as "
                           "--encopts gpu=N (only 0 is valid on a single-NVIDIA-GPU "
-                          "box); for qsv_h265/av1_qsv this is a oneVPL adapter index sent "
+                          "box); for qsv_h265/qsv_av1 this is a oneVPL adapter index sent "
                           "as --qsv-adapter=N (0 = HandBrake's own default, "
                           "the highest hardware-generation Intel GPU present)")
     run.add_argument("--preset", metavar="FILE",
