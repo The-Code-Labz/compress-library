@@ -181,10 +181,12 @@ With `--interlace-mode auto` (the default):
 3. Everything else is assumed progressive (matches the vast majority of
    H.264/H.265 BluRay/WEB rips, and keeps scanning fast).
 
-When a file is flagged interlaced, HandBrakeCLI gets
-`--comb-detect=default --decomb=default` — HandBrake's adaptive filter,
-which only touches frames it actually detects as combed, so it's safe even
-if the interlace call is a false positive on a handful of frames.
+When a file is flagged interlaced, HandBrakeCLI gets bare `--comb-detect
+--decomb` (enabled with HandBrake's documented CLI defaults) — an adaptive
+filter that only touches frames it actually detects as combed, so it's safe
+even if the interlace call is a false positive on a handful of frames. When
+a file is flagged progressive, it instead gets `--no-comb-detect
+--no-decomb` to actively disable the `Fast 1080p30` preset's own defaults.
 
 `--dry-run` shows the verdict per file (`interlaced=yes|no`) so you can
 review before committing to a batch. Use `--interlace-mode off` to disable
@@ -286,20 +288,37 @@ Copy `config.example.json` → `config.json` in the tool dir.
   percentage with `avg fps` stuck at `0.00`, pull latest - that was this bug,
   not your GPU/driver.
 
-- **Fixed (v1.7.1): non-interlaced sources still paid the full Comb
-  Detect + Decomb cost.** `--interlace-mode auto` correctly determines a
-  source isn't interlaced, but simply *not passing* `--comb-detect`/
-  `--decomb` does not disable them - the `Fast 1080p30` preset enables both
-  by default, so every progressive file still ran a full per-frame
-  comb-detect pass (and real decomb work on any falsely-flagged frames).
-  This was the single largest contributor to a real-world throughput gap
-  measured against bare `ffmpeg -hwaccel qsv ...` on the same file: 464 fps
-  raw vs. ~221-350 fps through this tool on a confirmed-progressive 2025
-  h264 source. Fixed by explicitly sending `--comb-detect=off --decomb=off`
-  whenever the source is not flagged interlaced, instead of omitting the
-  flags. Genuinely interlaced sources (VC-1/MPEG-2 titles, etc.) are
-  unaffected - they still get the adaptive `--comb-detect=default
-  --decomb=default` pair as before.
+- **Fixed (v1.7.1, then actually fixed in v1.7.2): non-interlaced sources
+  still paid the full Comb Detect + Decomb cost.** `--interlace-mode auto`
+  correctly determines a source isn't interlaced, but simply *not passing*
+  `--comb-detect`/`--decomb` does not disable them - the `Fast 1080p30`
+  preset enables both by default, so every progressive file still ran a full
+  per-frame comb-detect pass (and real decomb work on any falsely-flagged
+  frames). This was the single largest contributor to a real-world
+  throughput gap measured against bare `ffmpeg -hwaccel qsv ...` on the same
+  file: 464 fps raw vs. ~221-350 fps through this tool on a
+  confirmed-progressive 2025 h264 source.
+
+  **v1.7.1's fix was itself broken**: it sent `--comb-detect=off
+  --decomb=off` (and, for interlaced sources, `--comb-detect=default
+  --decomb=default`) — neither `"off"` nor `"default"` is a value either
+  flag accepts. Confirmed against HandBrakeCLI's own `--help`:
+  `--comb-detect[=string]` only takes presets `permissive`/`fast` or a
+  custom `key=value:...` string; `--decomb[=string]` only takes
+  `bob`/`eedi2`/`eedi2bob` or custom `key=value:...`. Passing either
+  unrecognized keyword crashed `hb_parse_filter_settings` immediately
+  (`"Invalid decomb option off"` / `"...option default"`), and HandBrakeCLI
+  still exited 0 with no output file written — surfacing not as a clean
+  encode failure but as `FAIL (verify): output unreadable by ffprobe` on
+  **every single job**, interlaced or not, regardless of encoder or GPU.
+
+  **v1.7.2 fix:** interlaced sources now get bare `--comb-detect --decomb`
+  (enables both with HandBrake's documented CLI defaults - the same values
+  the preset already applies, so this is a verified-safe no-op layered on
+  top). Non-interlaced sources get the actual documented way to disable a
+  preset-enabled filter: the dedicated boolean flags `--no-comb-detect
+  --no-decomb`. If every job in your library failed with `output unreadable
+  by ffprobe` after pulling v1.7.1, that was this bug - pull v1.7.2.
 
 - **Fixed (v1.6.1): `qsv_av1` was named `av1_qsv` in v1.6.0 - not a real
   HandBrakeCLI encoder.** Confirmed via a live `HandBrakeCLI --help`/trace on

@@ -32,7 +32,7 @@ try:
 except ImportError:  # pragma: no cover
     psutil = None
 
-__version__ = "1.7.1"
+__version__ = "1.7.2"
 
 VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 HEVC_CODEC_NAMES = {"hevc"}          # ffprobe codec_name values meaning "already H.265"
@@ -473,11 +473,26 @@ def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
         "--optimize",
     ]
     if deinterlace:
-        # `default` mode on both filters is frame-adaptive: comb-detect flags
-        # only actually-combed frames, decomb only touches those - safe to
-        # apply even if a handful of frames in an otherwise-interlaced source
-        # are progressive.
-        args += ["--comb-detect=default", "--decomb=default"]
+        # Bare flags (no "=value") enable comb-detect/decomb with their
+        # documented CLI defaults (mode=3 / mode=7 respectively), which is
+        # frame-adaptive: comb-detect flags only actually-combed frames,
+        # decomb only touches those - safe even if a handful of frames in an
+        # otherwise-interlaced source are progressive. This also matches what
+        # the "Fast 1080p30" preset already enables by default, so it's a
+        # documented, verified-safe no-op on top of the preset.
+        #
+        # BUG FIXED (v1.7.2): "--comb-detect=default"/"--decomb=default" was
+        # NEVER valid syntax. Confirmed against HandBrakeCLI's own --help:
+        # --comb-detect[=string] only accepts presets "permissive"/"fast" or
+        # a custom "key=value:..." string; --decomb[=string] only accepts
+        # "bob"/"eedi2"/"eedi2bob" or custom "key=value:...". "default" isn't
+        # a recognized token for either - passing it silently fell through
+        # to hb_parse_filter_settings, which choked on the bare word and
+        # errored ("Invalid decomb option default" / exits with no output),
+        # while HandBrakeCLI still returned exit code 0 - manifesting as
+        # verify()'s "output unreadable by ffprobe" rather than a clean
+        # encode failure.
+        args += ["--comb-detect", "--decomb"]
     else:
         # BUG (found live-tracing a "why is QSV so much slower than raw
         # ffmpeg" report): simply omitting --comb-detect/--decomb does NOT
@@ -489,9 +504,19 @@ def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
         # largest contributor to HandBrakeCLI's throughput gap vs. a bare
         # `ffmpeg -hwaccel qsv ...` encode of the same file (measured
         # 464fps raw vs ~221-350fps via this tool on a confirmed-progressive
-        # 2025 h264 source). Explicitly force both off for non-interlaced
-        # sources instead of relying on flag-absence.
-        args += ["--comb-detect=off", "--decomb=off"]
+        # 2025 h264 source).
+        #
+        # BUG FIXED (v1.7.2): "--comb-detect=off"/"--decomb=off" was ALSO
+        # never valid syntax (same root cause as above - "off" isn't a
+        # recognized preset/custom token for either filter, confirmed against
+        # HandBrakeCLI --help, and crashed identically: "hb_parse_filter_
+        # settings: Error parsing (off)" / "Invalid decomb option off",
+        # process exits 0 with no output file, surfacing as a verify()
+        # "output unreadable by ffprobe" failure on every single non-
+        # interlaced source once v1.7.1 shipped this). The actual documented
+        # way to disable a preset-enabled filter is HandBrake's dedicated
+        # boolean --no-<filter> flags, not a "=off" value.
+        args += ["--no-comb-detect", "--no-decomb"]
     if gpu_index is not None:
         # Pins the actual encode adapter. NVENC and QSV use two completely
         # different mechanisms in HandBrakeCLI - they are NOT interchangeable:
