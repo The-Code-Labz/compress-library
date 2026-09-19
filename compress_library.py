@@ -32,7 +32,7 @@ try:
 except ImportError:  # pragma: no cover
     psutil = None
 
-__version__ = "1.7.2"
+__version__ = "1.7.3"
 
 VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 HEVC_CODEC_NAMES = {"hevc"}          # ffprobe codec_name values meaning "already H.265"
@@ -78,8 +78,9 @@ def ffprobe_json(path: Path) -> dict | None:
             ["ffprobe", "-v", "error", "-show_format", "-show_streams",
              "-of", "json", str(path)],
             capture_output=True, text=True, timeout=120,
+            encoding="utf-8", errors="replace",
         )
-        if out.returncode != 0 or not out.stdout.strip():
+        if out.returncode != 0 or not out.stdout or not out.stdout.strip():
             return None
         return json.loads(out.stdout)
     except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
@@ -156,6 +157,7 @@ def detect_interlaced_idet(path: Path, sample_frames: int = 100) -> bool | None:
              "-i", str(path), "-frames:v", str(sample_frames),
              "-filter:v", "idet", "-f", "null", "-"],
             capture_output=True, text=True, timeout=60,
+            encoding="utf-8", errors="replace",
         )
     except (subprocess.SubprocessError, OSError):
         return None
@@ -552,7 +554,7 @@ def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
     log.debug("HandBrakeCLI: %s", " ".join(args))
     proc = subprocess.Popen(args, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True,
-                            errors="replace", bufsize=1)
+                            encoding="utf-8", errors="replace", bufsize=1)
     set_low_priority(proc)
     tail: list[str] = []
     reader = threading.Thread(target=_pump_handbrake_output,
@@ -856,7 +858,7 @@ def cmd_preflight(_args) -> int:
             out = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
                  "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, timeout=30, errors="replace")
             gpus = [l.strip() for l in out.stdout.splitlines() if l.strip()]
             print(f"\n  GPUs detected ({len(gpus)}):")
             for g in gpus:

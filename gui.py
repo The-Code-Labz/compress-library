@@ -469,9 +469,12 @@ class CompressLibraryGUI:
         kwargs = {}
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8:replace"
         self.proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, cwd=str(TOOL_DIR), **kwargs,
+            text=True, encoding="utf-8", errors="replace",
+            bufsize=1, cwd=str(TOOL_DIR), env=env, **kwargs,
         )
         threading.Thread(target=self._reader_thread, args=(self.proc,), daemon=True).start()
 

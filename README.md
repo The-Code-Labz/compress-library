@@ -261,6 +261,29 @@ Copy `config.example.json` → `config.json` in the tool dir.
 
 ## Caveats worth knowing
 
+- **Fixed (v1.7.3): ffprobe/ffmpeg/PowerShell subprocess calls crashed on
+  non-Windows-1252 bytes in their output.** `subprocess.run(..., text=True)`
+  with no `encoding=`/`errors=` falls back to the OS locale's preferred
+  encoding - on a default Windows install that's `cp1252`, which has several
+  genuinely undefined byte positions (`0x81`, `0x8D`, `0x8F`, `0x90`, `0x9D`).
+  Any file with non-ASCII metadata (foreign-language subtitle track titles,
+  accented movie titles, etc.) that ffprobe echoes back as raw UTF-8 could
+  contain one of those bytes, which crashes Python's `charmap` codec with a
+  hard `UnicodeDecodeError` - either surfacing as `AttributeError: 'NoneType'
+  object has no attribute 'strip'` in `ffprobe_json()` (the decode failure
+  happens deep in `communicate()`'s reader thread and leaves `stdout` unset)
+  or as an unhandled `Exception in thread Thread-N (_readerthread)`
+  traceback that kills the whole batch mid-scan. Fixed: every
+  `subprocess.run`/`Popen` call that reads ffprobe/ffmpeg/PowerShell/
+  HandBrakeCLI output now passes `encoding="utf-8", errors="replace"`
+  explicitly (PowerShell's GPU-name probe keeps the OS locale but adds
+  `errors="replace"`, since its output isn't UTF-8), plus a defensive
+  `out.stdout is None` guard in `ffprobe_json()` so a decode hiccup degrades
+  to "couldn't probe this file" instead of crashing the whole run. The GUI's
+  own subprocess launch was fixed the same way, with
+  `PYTHONIOENCODING=utf-8:replace` set on the child's environment so
+  `compress_library.py`'s own stdout matches what the GUI decodes it as.
+
 - **Fixed (v1.7.0): `--all-subtitles` silently enabled HandBrake's "Foreign
   Audio Search" on any source with a forced subtitle track, which looked
   exactly like a hang.** Confirmed via a live `--verbose=1` trace on a
