@@ -23,6 +23,8 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.error
+import urllib.request
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -33,20 +35,58 @@ except ImportError:  # pragma: no cover - psutil is a requirements.txt dep, but 
 
 TOOL_DIR = Path(__file__).resolve().parent
 SCRIPT_PATH = TOOL_DIR / "compress_library.py"
+GUI_PATH = Path(__file__).resolve()
 GiB = 1024 ** 3
+
+# --- Auto-update -----------------------------------------------------------
+# gui.py never imports compress_library internals (see module docstring), so
+# the version is read from the script text via regex rather than importing
+# it - this keeps the two processes fully decoupled while still letting the
+# GUI compare its own bundled core against what's on GitHub.
+UPDATE_REPO = "The-Code-Labz/compress-library"
+UPDATE_BRANCH = "main"
+RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
+VERSION_RE = re.compile(r'__version__\s*=\s*"([\d.]+)"')
+
+
+def _parse_version(text: str) -> tuple[int, ...] | None:
+    m = VERSION_RE.search(text)
+    if not m:
+        return None
+    return tuple(int(x) for x in m.group(1).split("."))
+
+
+def _local_version() -> str | None:
+    try:
+        text = SCRIPT_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    m = VERSION_RE.search(text)
+    return m.group(1) if m else None
+
+
+def _fetch_remote(name: str, timeout: int = 10) -> str:
+    req = urllib.request.Request(
+        f"{RAW_BASE}/{name}",
+        headers={"User-Agent": "compress-library-gui-updater"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
 
 ENCODE_RE = re.compile(r"ENCODE \[(?P<enc>[\w_]+)\] (?P<path>.+?) \(")
 DONE_RE = re.compile(r"\bDONE (?P<path>.+?): .*\((?P<pct>[\d.]+)% of original\)")
 FAIL_RE = re.compile(r"\bFAIL \((?P<stage>\w+)\) (?P<path>.+?): (?P<reason>.+)")
 SKIP_LOCKED_RE = re.compile(r"SKIP \(locked\) (?P<path>.+)")
-SKIP_HEVC_RE = re.compile(r"SKIP \(already H\.265\) (?P<path>.+)")
+SKIP_HEVC_RE = re.compile(r"SKIP \(already (?:H\.265|AV1)\) (?P<path>.+)")
 SCAN_RE = re.compile(r"Scan: (?P<n>\d+) candidates")
 BATCH_DONE_RE = re.compile(r"Batch complete: (?P<summary>.+)")
 
 DRY_ROW_RE = re.compile(
-    r"^\s{2}(?P<path>.+?)\s+\[(?P<size>[\d.]+) GiB, codec=(?P<codec>\S+)(?:, est\. out ~(?P<est>[\d.]+) GiB)?\]$"
+    r"^\s{2}(?P<path>.+?)\s+\[(?P<size>[\d.]+) GiB, codec=(?P<codec>\S+)"
+    r"(?:, interlaced=(?P<interlaced>yes|no))?(?:, est\. out ~(?P<est>[\d.]+) GiB)?\]$"
 )
-DRY_SKIP_RE = re.compile(r"^\s{2}SKIP \(already H\.265\) (?P<path>.+?)\s+\[(?P<size>[\d.]+) GiB, codec=(?P<codec>\S+)\]$")
+DRY_SKIP_RE = re.compile(r"^\s{2}SKIP \(already (?:H\.265|AV1)\) (?P<path>.+?)\s+\[(?P<size>[\d.]+) GiB, codec=(?P<codec>\S+)\]$")
+DRY_RECOMPRESS_PREFIX_RE = re.compile(r"^\s{2}RECOMPRESS \(oversized (?:H\.265|AV1)\) ")
 
 PROC_DONE = "\x00PROC_DONE\x00"
 
@@ -65,9 +105,99 @@ class CompressLibraryGUI:
         self.total_candidates = 0
         self.start_time = 0.0
 
+        self._build_menu()
         self._build_widgets()
         self.root.after(120, self._poll_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(2000, lambda: self._check_for_updates(silent=True))
+
+    # ------------------------------------------------------------------
+    # Menu / auto-update
+    # ------------------------------------------------------------------
+    def _build_menu(self):
+        menubar = tk.Menu(self.root)
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="Check for Updates…",
+                              command=lambda: self._check_for_updates(silent=False))
+        help_menu.add_separator()
+        help_menu.add_command(label="About", command=self._show_about)
+        menubar.add_cascade(label="Help", menu=help_menu)
+        self.root.config(menu=menubar)
+
+    def _show_about(self):
+        v = _local_version() or "unknown"
+        messagebox.showinfo("compress-library",
+                            f"compress-library GUI\nCore version: {v}\n"
+                            f"Repo: https://github.com/{UPDATE_REPO}")
+
+    def _check_for_updates(self, silent: bool):
+        threading.Thread(target=self._check_for_updates_worker, args=(silent,), daemon=True).start()
+
+    def _check_for_updates_worker(self, silent: bool):
+        local_v = _local_version()
+        try:
+            remote_text = _fetch_remote("compress_library.py")
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if not silent:
+                self.root.after(0, lambda: messagebox.showerror(
+                    "compress-library", f"Update check failed: {exc}"))
+            return
+        remote_v = _parse_version(remote_text)
+        local_tuple = tuple(int(x) for x in local_v.split(".")) if local_v else None
+        if remote_v is None:
+            if not silent:
+                self.root.after(0, lambda: messagebox.showerror(
+                    "compress-library", "Update check failed: couldn't read remote version."))
+            return
+        remote_str = ".".join(str(x) for x in remote_v)
+        if local_tuple is not None and remote_v <= local_tuple:
+            if not silent:
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "compress-library", f"Up to date (v{local_v})."))
+            return
+        self.root.after(0, lambda: self._offer_update(local_v or "unknown", remote_str, remote_text))
+
+    def _offer_update(self, local_v: str, remote_v: str, remote_core_text: str):
+        if not messagebox.askyesno(
+            "compress-library — Update available",
+            f"A newer version is available: v{remote_v} (you have v{local_v}).\n\n"
+            f"Download and install it now? Current files will be backed up, "
+            f"and you'll need to restart the GUI to run the new code."
+        ):
+            return
+        threading.Thread(target=self._do_update, args=(remote_core_text,), daemon=True).start()
+
+    def _do_update(self, remote_core_text: str):
+        try:
+            remote_gui_text = _fetch_remote("gui.py")
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            self.root.after(0, lambda: messagebox.showerror(
+                "compress-library", f"Update download failed: {exc}"))
+            return
+        if "def main(" not in remote_core_text or "def main(" not in remote_gui_text:
+            self.root.after(0, lambda: messagebox.showerror(
+                "compress-library", "Update aborted: downloaded files failed a sanity check."))
+            return
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        try:
+            for path, text in ((SCRIPT_PATH, remote_core_text), (GUI_PATH, remote_gui_text)):
+                backup = path.with_name(f"{path.name}.bak-{ts}")
+                backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+                tmp = path.with_suffix(path.suffix + ".new")
+                tmp.write_text(text, encoding="utf-8")
+                os.replace(tmp, path)
+        except OSError as exc:
+            self.root.after(0, lambda: messagebox.showerror(
+                "compress-library", f"Update install failed: {exc}"))
+            return
+        self.root.after(0, self._update_installed)
+
+    def _update_installed(self):
+        if messagebox.askyesno(
+            "compress-library", "Update installed. Restart the GUI now to apply it?"
+        ):
+            self.root.destroy()
+            os.execv(sys.executable, [sys.executable, str(GUI_PATH), *sys.argv[1:]])
 
     # ------------------------------------------------------------------
     # Widget construction
@@ -90,6 +220,7 @@ class CompressLibraryGUI:
         self.var_quality = tk.DoubleVar(value=25.0)
         self.var_qsv = tk.BooleanVar(value=True)
         self.var_nvenc = tk.BooleanVar(value=True)
+        self.var_qsv_av1 = tk.BooleanVar(value=False)
         self.var_gpu_assign = tk.StringVar(value="0,1")
         self.var_temp_dir = tk.StringVar()
         self.var_duration_tol = tk.DoubleVar(value=2.0)
@@ -100,6 +231,8 @@ class CompressLibraryGUI:
         self.var_config = tk.StringVar()
         self.var_hb_bin = tk.StringVar(value="HandBrakeCLI")
         self.var_preset = tk.StringVar()
+        self.var_interlace_mode = tk.StringVar(value="auto")
+        self.var_recompress_hevc_over = tk.DoubleVar(value=0.0)
 
         r = 0
         self._field(opts, r, 0, "Min size (GB)", ttk.Spinbox(opts, textvariable=self.var_min_size, from_=0, to=1000, increment=0.5, width=10))
@@ -110,6 +243,7 @@ class CompressLibraryGUI:
         encf.grid(row=r, column=1, sticky="w")
         ttk.Checkbutton(encf, text="qsv_h265 (GPU0)", variable=self.var_qsv).pack(side="left")
         ttk.Checkbutton(encf, text="nvenc_h265 (GPU1)", variable=self.var_nvenc).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(encf, text="qsv_av1 (Arc, replaces qsv_h265)", variable=self.var_qsv_av1).pack(side="left", padx=(8, 0))
         self._field(opts, r, 2, "GPU assign", ttk.Entry(opts, textvariable=self.var_gpu_assign, width=12))
         r += 1
         self._field_browse(opts, r, 0, "Temp dir", self.var_temp_dir, dir_only=True)
@@ -125,6 +259,13 @@ class CompressLibraryGUI:
         self._field_browse(opts, r, 2, "HandBrakeCLI path", self.var_hb_bin, file_only=True)
         r += 1
         self._field_browse(opts, r, 0, "Preset JSON (optional)", self.var_preset, save=True, pattern="*.json")
+        self._field(opts, r, 2, "Interlace mode",
+                    ttk.Combobox(opts, textvariable=self.var_interlace_mode,
+                                 values=("auto", "force", "off"), state="readonly", width=10))
+        r += 1
+        self._field(opts, r, 0, "Recompress HEVC over (GB)",
+                    ttk.Spinbox(opts, textvariable=self.var_recompress_hevc_over,
+                                from_=0, to=1000, increment=0.5, width=10))
         r += 1
         ttk.Label(opts, text="Extra HandBrakeCLI args\n(one per line)").grid(row=r, column=0, sticky="nw", padx=6, pady=4)
         self.txt_extra_args = tk.Text(opts, height=3, width=50)
@@ -163,9 +304,9 @@ class CompressLibraryGUI:
         # --- Dry-run preview tab ---
         preview_tab = ttk.Frame(nb)
         nb.add(preview_tab, text="Dry-Run Preview")
-        cols = ("path", "size", "codec", "status", "est_out")
+        cols = ("path", "size", "codec", "interlaced", "status", "est_out")
         self.tree_preview = ttk.Treeview(preview_tab, columns=cols, show="headings")
-        for c, w in zip(cols, (520, 90, 100, 130, 100)):
+        for c, w in zip(cols, (480, 90, 90, 80, 130, 100)):
             self.tree_preview.heading(c, text=c.replace("_", " ").title())
             self.tree_preview.column(c, width=w, anchor="w")
         self.tree_preview.pack(fill="both", expand=True)
@@ -236,7 +377,9 @@ class CompressLibraryGUI:
             messagebox.showerror("compress-library", "Choose a valid library root directory first.")
             return None
         encoders = []
-        if self.var_qsv.get():
+        if self.var_qsv_av1.get():
+            encoders.append("qsv_av1")  # replaces qsv_h265 on the same QSV/Arc lane
+        elif self.var_qsv.get():
             encoders.append("qsv_h265")
         if self.var_nvenc.get():
             encoders.append("nvenc_h265")
@@ -248,6 +391,8 @@ class CompressLibraryGUI:
         if dry_run:
             args.append("--dry-run")
         args += ["--min-size", str(self.var_min_size.get())]
+        if self.var_recompress_hevc_over.get() > 0:
+            args += ["--recompress-hevc-over", str(self.var_recompress_hevc_over.get())]
         args += ["--quality", str(self.var_quality.get())]
         args += ["--encoder", *encoders]
         args += ["--gpu-assign", self.var_gpu_assign.get().strip() or "0,1"]
@@ -265,10 +410,11 @@ class CompressLibraryGUI:
             args += ["--handbrake-cli", self.var_hb_bin.get().strip()]
         if self.var_preset.get().strip():
             args += ["--preset", self.var_preset.get().strip()]
+        args += ["--interlace-mode", self.var_interlace_mode.get() or "auto"]
         for line in self.txt_extra_args.get("1.0", "end").splitlines():
             line = line.strip()
             if line:
-                args += ["--extra-arg", line]
+                args.append(f"--extra-arg={line}")
         if not self.var_resume.get():
             args.append("--no-resume")
         return args
@@ -323,9 +469,12 @@ class CompressLibraryGUI:
         kwargs = {}
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8:replace"
         self.proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, cwd=str(TOOL_DIR), **kwargs,
+            text=True, encoding="utf-8", errors="replace",
+            bufsize=1, cwd=str(TOOL_DIR), env=env, **kwargs,
         )
         threading.Thread(target=self._reader_thread, args=(self.proc,), daemon=True).start()
 
@@ -442,9 +591,12 @@ class CompressLibraryGUI:
             if m:
                 skip_count += 1
                 self.tree_preview.insert("", "end", values=(
-                    m.group("path"), m.group("size"), m.group("codec"), "already H.265", "-"))
+                    m.group("path"), m.group("size"), m.group("codec"), "-",
+                    f"already {m.group('codec')}", "-"))
                 continue
-            m = DRY_ROW_RE.match(line)
+            recompress = bool(DRY_RECOMPRESS_PREFIX_RE.match(line))
+            line_for_row = DRY_RECOMPRESS_PREFIX_RE.sub("  ", line) if recompress else line
+            m = DRY_ROW_RE.match(line_for_row)
             if m:
                 size = float(m.group("size"))
                 est = float(m.group("est")) if m.group("est") else 0.0
@@ -452,10 +604,13 @@ class CompressLibraryGUI:
                 total_est += est
                 enc_count += 1
                 self.tree_preview.insert("", "end", values=(
-                    m.group("path"), f"{size:.2f}", m.group("codec"), "to encode", f"{est:.2f}"))
+                    m.group("path"), f"{size:.2f}", m.group("codec"),
+                    m.group("interlaced") or "-",
+                    (f"recompress (oversized {m.group('codec')})" if recompress else "to encode"),
+                    f"{est:.2f}"))
         self.var_preview_summary.set(
             f"{enc_count} to encode ({total_in:.2f} GiB -> ~{total_est:.2f} GiB est.), "
-            f"{skip_count} already H.265"
+            f"{skip_count} already-compressed skipped"
         )
 
     # ------------------------------------------------------------------

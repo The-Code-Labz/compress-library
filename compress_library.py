@@ -18,13 +18,13 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 try:
@@ -32,10 +32,20 @@ try:
 except ImportError:  # pragma: no cover
     psutil = None
 
+__version__ = "1.7.3"
+
 VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".avi", ".ts"}
 HEVC_CODEC_NAMES = {"hevc"}          # ffprobe codec_name values meaning "already H.265"
+AV1_CODEC_NAMES = {"av1"}            # ffprobe codec_name value meaning "already AV1"
 HEVC_TAGS = {"hvc1", "hev1"}         # mp4 codec_tag fallbacks
 GiB = 1024 ** 3
+
+# Codecs where ffprobe's `field_order` metadata is frequently absent/"unknown"
+# even on genuinely interlaced sources (common with older VC-1/MPEG-2 Blu-ray
+# remuxes). For these, an ambiguous field_order triggers a real idet sample
+# instead of being assumed progressive.
+INTERLACE_PRONE_CODECS = {"vc1", "mpeg2video", "mpeg1video"}
+INTERLACED_FIELD_ORDERS = {"tt", "bb", "tb", "bt"}
 
 TOOL_DIR = Path(__file__).resolve().parent
 DEFAULT_MANIFEST = TOOL_DIR / "manifest.db"
@@ -68,8 +78,9 @@ def ffprobe_json(path: Path) -> dict | None:
             ["ffprobe", "-v", "error", "-show_format", "-show_streams",
              "-of", "json", str(path)],
             capture_output=True, text=True, timeout=120,
+            encoding="utf-8", errors="replace",
         )
-        if out.returncode != 0 or not out.stdout.strip():
+        if out.returncode != 0 or not out.stdout or not out.stdout.strip():
             return None
         return json.loads(out.stdout)
     except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
@@ -83,7 +94,18 @@ def stream_info(path: Path) -> dict | None:
         return None
     streams = data.get("streams", [])
     audio = sum(1 for s in streams if s.get("codec_type") == "audio")
-    subtitles = sum(1 for s in streams if s.get("codec_type") == "subtitle")
+    # eia_608/eia_708 are embedded closed-caption data ffprobe reports as a
+    # pseudo "subtitle" stream (common on Blu-ray remuxes). HandBrake's
+    # scanner does not enumerate these as selectable subtitle tracks, so
+    # --all-subtitles never copies them - counting them here made verify()
+    # fail almost every title with an off-by-one "subtitle tracks N < input
+    # N+1" false positive, even though nothing real was actually lost.
+    _NON_TRACK_SUBTITLE_CODECS = {"eia_608", "eia_708"}
+    subtitles = sum(
+        1 for s in streams
+        if s.get("codec_type") == "subtitle"
+        and (s.get("codec_name") or "").lower() not in _NON_TRACK_SUBTITLE_CODECS
+    )
     video = next((s for s in streams if s.get("codec_type") == "video"), {})
     duration = 0.0
     try:
@@ -103,11 +125,79 @@ def stream_info(path: Path) -> dict | None:
         "subtitles": subtitles,
         "video_codec": (video.get("codec_name") or "").lower(),
         "codec_tag": (video.get("codec_tag_string") or "").lower(),
+        "field_order": (video.get("field_order") or "").lower(),
     }
 
 
 def is_h265(info: dict) -> bool:
     return info["video_codec"] in HEVC_CODEC_NAMES or info["codec_tag"] in HEVC_TAGS
+
+
+def is_av1(info: dict) -> bool:
+    return info["video_codec"] in AV1_CODEC_NAMES
+
+
+def already_compressed(info: dict) -> bool:
+    """HEVC or AV1 - both are "already efficient" codecs where a blanket
+    re-encode would be lossy-on-lossy, so both get the same skip treatment."""
+    return is_h265(info) or is_av1(info)
+
+
+def codec_label(info: dict) -> str:
+    return "AV1" if is_av1(info) else "H.265"
+
+
+def detect_interlaced_idet(path: Path, sample_frames: int = 100) -> bool | None:
+    """Decode a short sample through ffmpeg's `idet` filter and compare
+    TFF/BFF vs progressive frame counts. Returns True/False, or None if
+    ffmpeg is unavailable or the sample couldn't be analyzed."""
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-an", "-sn",
+             "-i", str(path), "-frames:v", str(sample_frames),
+             "-filter:v", "idet", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=60,
+            encoding="utf-8", errors="replace",
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    # ffmpeg can emit more than one "Multi frame detection" summary (e.g. an
+    # early near-zero snapshot before the final tally) - always take the
+    # last one, which reflects the full sample.
+    matches = re.findall(
+        r"Multi frame detection:\s*TFF:\s*(\d+)\s*BFF:\s*(\d+)\s*Progressive:\s*(\d+)",
+        out.stderr,
+    )
+    if not matches:
+        return None
+    tff, bff, progressive = (int(g) for g in matches[-1])
+    if tff + bff + progressive == 0:
+        return None
+    return (tff + bff) > progressive
+
+
+def check_interlaced(path: Path, info: dict) -> bool:
+    """Best-effort interlace detection: trust explicit field_order metadata
+    first (free); only fall back to a real ffmpeg idet sample when the
+    codec is known to under-report field_order (vc1/mpeg2/mpeg1)."""
+    fo = info.get("field_order", "")
+    if fo in INTERLACED_FIELD_ORDERS:
+        return True
+    if fo == "progressive":
+        return False
+    if info.get("video_codec") in INTERLACE_PRONE_CODECS:
+        result = detect_interlaced_idet(path)
+        if result is not None:
+            return result
+    return False
+
+
+def resolve_interlaced(path: Path, info: dict, mode: str) -> bool:
+    if mode == "off":
+        return False
+    if mode == "force":
+        return True
+    return check_interlaced(path, info)
 
 
 # ---------------------------------------------------------------------------
@@ -259,9 +349,81 @@ def set_low_priority(proc: subprocess.Popen):
         pass  # priority is best-effort; never fail an encode over it
 
 
+# HandBrakeCLI writes its per-file progress as a repeatedly-overwritten line
+# ("Encoding: task 1 of 1, 34.56 % (123.45 fps, avg 100.00 fps, ETA 00h05m23s)")
+# using a bare \r, not \n - a plain `for line in proc.stdout` (line-buffered on
+# \n) never sees it, which is why the GUI/CLI log looked dead for the entire
+# multi-minute duration of a single encode.
+_HB_PROGRESS_RE = re.compile(
+    r"Encoding: task \d+ of \d+, (\d+(?:\.\d+)?)\s*%"
+    r"(?:\s*\(([\d.]+) fps, avg ([\d.]+) fps, ETA ([0-9hms]+)\))?"
+)
+
+
+def _pump_handbrake_output(proc: subprocess.Popen, tail: list[str],
+                           progress_cb) -> None:
+    """Read HandBrakeCLI's merged stdout/stderr live, splitting on \\r or \\n
+    so in-place progress updates are seen as they happen. Keeps a rolling
+    tail of raw lines (for failure diagnostics) and forwards parsed
+    percentages to progress_cb, throttled to whole-percent steps."""
+    buf = ""
+    last_pct = -1.0
+    init_done = False
+    init_count = 0
+    try:
+        while True:
+            chunk = proc.stdout.read(256)
+            if not chunk:
+                break
+            buf += chunk
+            while True:
+                cr, nl = buf.find("\r"), buf.find("\n")
+                candidates = [i for i in (cr, nl) if i != -1]
+                if not candidates:
+                    break
+                idx = min(candidates)
+                line, buf = buf[:idx].strip(), buf[idx + 1:]
+                if not line:
+                    continue
+                tail.append(line)
+                del tail[:-40]
+                m = _HB_PROGRESS_RE.search(line)
+                if m and progress_cb:
+                    init_done = True
+                    pct = float(m.group(1))
+                    if pct - last_pct >= 1.0 or pct >= 100.0:
+                        last_pct = pct
+                        fps = m.group(3) or "?"
+                        eta = m.group(4) or "?"
+                        progress_cb(f"{pct:.1f}% (avg {fps} fps, ETA {eta})")
+                elif not init_done and progress_cb and init_count < 30:
+                    # Before the first progress line, HandBrakeCLI prints its
+                    # scan/init log - including the oneVPL/QSV adapter-selection
+                    # line ("Impl ... adapter index N") and NVENC/CUDA device
+                    # info. This is the only place that confirms which physical
+                    # GPU --qsv-adapter/--encopts gpu= actually bound to.
+                    # Previously it only lived in the 40-line rolling `tail`
+                    # (dumped on FAILURE only) - on a successful/still-running
+                    # job it silently scrolled out within seconds of the first
+                    # progress update, so --verbose=1 never actually showed
+                    # device selection in the Log tab no matter how long you
+                    # watched. Surface it explicitly, once, here.
+                    init_count += 1
+                    progress_cb(f"[init] {line}")
+    except (ValueError, OSError):
+        pass  # pipe closed under us (process killed on timeout) - not fatal
+    finally:
+        line = buf.strip()
+        if line:
+            tail.append(line)
+            del tail[:-40]
+
+
 def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
                      preset_import: str | None, extra_args: list[str],
-                     hb_bin: str, timeout: int) -> None:
+                     hb_bin: str, timeout: int, deinterlace: bool = False,
+                     gpu_index: int | None = None, progress_cb=None,
+                     subtitle_count: int | None = None) -> None:
     args = [
         hb_bin,
         "-i", str(src),
@@ -273,26 +435,148 @@ def handbrake_encode(src: Path, dst: Path, encoder: str, quality: float,
         "--aencoder", "copy",
         "--audio-copy-mask", "aac,ac3,eac3,dts,dtshd,truehd,mp3,flac,opus",
         "--audio-fallback", "ffac3",
-        "--all-subtitles",
-        "--subtitle-burned", "none",
+    ]
+    # --all-subtitles silently enables HandBrake's "Foreign Audio Search" on
+    # any source with a forced subtitle track (confirmed via a live
+    # --verbose=1 trace: the constructed job JSON showed
+    # Subtitle.Search.Enable=true only when --all-subtitles was used, false
+    # when subtitles were explicitly restricted). Foreign Audio Search is a
+    # full extra decode-only pre-pass over the ENTIRE file to pick a forced
+    # track to burn in - on a multi-hour source this looks exactly like a
+    # hang: HandBrake's own progress % (bytes read) races ahead while avg fps
+    # (frames actually finished) stays pinned at 0.00 for the whole pre-pass,
+    # and no DONE/FAIL is logged until it finally completes. This is an
+    # upstream HandBrake bug (--all-subtitles is documented as unrelated to
+    # the "scan" pseudo-track that's supposed to be the only Foreign Audio
+    # Search trigger - see HandBrake/HandBrake#5731) with no clean CLI flag
+    # to force it back off once triggered (#7788). Fix: never pass the
+    # literal "scan"/--all-subtitles value - select every real subtitle
+    # track by its explicit 1-based index instead, which does not trigger
+    # the search. Falls back to --all-subtitles only when subtitle_count is
+    # unknown (stream_info()/ffprobe couldn't read the file at all).
+    if subtitle_count is None:
+        args.append("--all-subtitles")
+    elif subtitle_count > 0:
+        args += ["-s", ",".join(str(i) for i in range(1, subtitle_count + 1))]
+    args += [
+        # --subtitle-burned takes an OPTIONAL argument (getopt_long style:
+        # "[=number, \"native\", or \"none\"]"). Passing it as two separate
+        # argv tokens ("--subtitle-burned", "none") does NOT bind "none" as
+        # the value - getopt treats the option as given with no argument at
+        # all, which falls back to its documented no-argument default:
+        # "if number is omitted, the first track is burned". That silently
+        # burned-in the first (usually default-flagged) subtitle track on
+        # every single encode, dropping it from the passthrough count and
+        # causing verify()'s near-universal "subtitle tracks N < input N+1"
+        # false failure. Confirmed via a live HandBrakeCLI --verbose=1 trace
+        # (space form: "-> Render/Burn-in, Default"; "=" form: "-> Passthru,
+        # Default"). Must be one joined token.
+        "--subtitle-burned=none",
         "--optimize",
     ]
+    if deinterlace:
+        # Bare flags (no "=value") enable comb-detect/decomb with their
+        # documented CLI defaults (mode=3 / mode=7 respectively), which is
+        # frame-adaptive: comb-detect flags only actually-combed frames,
+        # decomb only touches those - safe even if a handful of frames in an
+        # otherwise-interlaced source are progressive. This also matches what
+        # the "Fast 1080p30" preset already enables by default, so it's a
+        # documented, verified-safe no-op on top of the preset.
+        #
+        # BUG FIXED (v1.7.2): "--comb-detect=default"/"--decomb=default" was
+        # NEVER valid syntax. Confirmed against HandBrakeCLI's own --help:
+        # --comb-detect[=string] only accepts presets "permissive"/"fast" or
+        # a custom "key=value:..." string; --decomb[=string] only accepts
+        # "bob"/"eedi2"/"eedi2bob" or custom "key=value:...". "default" isn't
+        # a recognized token for either - passing it silently fell through
+        # to hb_parse_filter_settings, which choked on the bare word and
+        # errored ("Invalid decomb option default" / exits with no output),
+        # while HandBrakeCLI still returned exit code 0 - manifesting as
+        # verify()'s "output unreadable by ffprobe" rather than a clean
+        # encode failure.
+        args += ["--comb-detect", "--decomb"]
+    else:
+        # BUG (found live-tracing a "why is QSV so much slower than raw
+        # ffmpeg" report): simply omitting --comb-detect/--decomb does NOT
+        # disable them - the "Fast 1080p30" preset enables Comb Detect +
+        # Decomb by default, so every progressive source still paid for a
+        # full per-frame comb-detect pass (and real decomb work on any
+        # falsely-flagged frames) even when our own auto-detection correctly
+        # determined the source isn't interlaced. This was the single
+        # largest contributor to HandBrakeCLI's throughput gap vs. a bare
+        # `ffmpeg -hwaccel qsv ...` encode of the same file (measured
+        # 464fps raw vs ~221-350fps via this tool on a confirmed-progressive
+        # 2025 h264 source).
+        #
+        # BUG FIXED (v1.7.2): "--comb-detect=off"/"--decomb=off" was ALSO
+        # never valid syntax (same root cause as above - "off" isn't a
+        # recognized preset/custom token for either filter, confirmed against
+        # HandBrakeCLI --help, and crashed identically: "hb_parse_filter_
+        # settings: Error parsing (off)" / "Invalid decomb option off",
+        # process exits 0 with no output file, surfacing as a verify()
+        # "output unreadable by ffprobe" failure on every single non-
+        # interlaced source once v1.7.1 shipped this). The actual documented
+        # way to disable a preset-enabled filter is HandBrake's dedicated
+        # boolean --no-<filter> flags, not a "=off" value.
+        args += ["--no-comb-detect", "--no-decomb"]
+    if gpu_index is not None:
+        # Pins the actual encode adapter. NVENC and QSV use two completely
+        # different mechanisms in HandBrakeCLI - they are NOT interchangeable:
+        #   - nvenc_h265: "gpu=N" is a private --encopts key forwarded to
+        #     ffmpeg's h265_nvenc, where N is a CUDA device index.
+        #   - qsv_h265: adapter selection is a *top-level* CLI flag,
+        #     --qsv-adapter=N (oneVPL adapter index) - it is NOT an --encopts
+        #     key. Passing "--encopts gpu=N" to qsv_h265 is a silent no-op:
+        #     QSV has no "gpu" encopt, so it keeps using its own default
+        #     (the adapter with the highest hardware generation), which is
+        #     NOT guaranteed to be the adapter you asked for.
+        # Placed before extra_args so a user override still wins
+        # (HandBrakeCLI uses the last occurrence of a repeated option).
+        if encoder.startswith("nvenc"):
+            args += ["--encopts", f"gpu={gpu_index}"]
+        elif "qsv" in encoder:  # qsv_h265, qsv_av1 - both are oneVPL/QSV adapters
+            # --qsv-adapter is declared as a getopt_long OPTIONAL-argument
+            # flag ("--qsv-adapter[=index]"), same family as
+            # --subtitle-burned above which was CONFIRMED to silently drop
+            # a two-token "--subtitle-burned none" value. Live-traced
+            # --qsv-adapter itself and its two-token form did bind
+            # correctly in this HandBrakeCLI build (confirmed a bad index
+            # via space form produced "failed to create hwdevice" - i.e.
+            # the value WAS received), but the single joined "=" token is
+            # the form HandBrake's own --help documents and is unambiguous
+            # under getopt_long, so use it defensively rather than rely on
+            # this build's specific (undocumented) leniency.
+            args += [f"--qsv-adapter={gpu_index}"]
     if preset_import:
         args += ["--preset-import-file", preset_import]
     args += extra_args
 
     log.debug("HandBrakeCLI: %s", " ".join(args))
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True,
+                            encoding="utf-8", errors="replace", bufsize=1)
     set_low_priority(proc)
+    tail: list[str] = []
+    reader = threading.Thread(target=_pump_handbrake_output,
+                              args=(proc, tail, progress_cb), daemon=True)
+    reader.start()
     try:
-        rc = proc.wait(timeout=timeout)
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+        reader.join(timeout=5)
         raise RuntimeError(f"encode timed out after {timeout}s")
-    if rc != 0:
-        raise RuntimeError(f"HandBrakeCLI exited with code {rc}")
+    reader.join(timeout=10)
+    if proc.returncode != 0:
+        # HandBrakeCLI's real diagnostic (encoder init failure, invalid
+        # --encopts value, missing codec, etc.) is in its own output - surface
+        # the tail of it instead of just the exit code, which is otherwise
+        # useless for diagnosing e.g. an out-of-range --encopts gpu=N.
+        msg = f"HandBrakeCLI exited with code {proc.returncode}"
+        if tail:
+            msg += "\n" + "\n".join(tail[-20:])
+        raise RuntimeError(msg)
 
 
 def verify(src: Path, dst: Path, tolerance: float) -> list[str]:
@@ -358,9 +642,8 @@ def scan(root: Path, min_bytes: int, manifest: Manifest, resume: bool,
     return candidates
 
 
-def process_file(src: Path, args, encoders: list[str], manifest: Manifest,
-                 worker_idx: int) -> str:
-    encoder = encoders[worker_idx % len(encoders)]
+def process_file(src: Path, args, encoder: str, manifest: Manifest,
+                 gpu_index: int | None = None) -> str:
     size = src.stat().st_size
 
     # 1. Locked by Plex/Jellyfin/etc?
@@ -369,12 +652,20 @@ def process_file(src: Path, args, encoders: list[str], manifest: Manifest,
         manifest.set_status(str(src), size, "locked")
         return "locked"
 
-    # 2. Already H.265?
+    # 2. Already HEVC/AV1? Skip unless it's oversized enough that HandBrake at
+    # this quality/RF setting could still meaningfully shrink it (e.g. a
+    # high-bitrate HEVC remux that was itself encoded at a low RF) - only
+    # applies when --recompress-hevc-over is set; 0/unset preserves the
+    # original "never touch an already-compressed file" behavior.
     info = stream_info(src)
-    if info and is_h265(info):
-        log.info("SKIP (already H.265) %s", src)
-        manifest.set_status(str(src), size, "skipped-hevc")
-        return "skipped-hevc"
+    recompress_over = getattr(args, "recompress_hevc_over", 0.0) or 0.0
+    if info and already_compressed(info):
+        if not (recompress_over > 0 and size >= recompress_over * GiB):
+            log.info("SKIP (already %s) %s", codec_label(info), src)
+            manifest.set_status(str(src), size, "skipped-hevc")
+            return "skipped-hevc"
+        log.info("RECOMPRESS (oversized %s, %.2f GiB >= %.2f GiB threshold) %s",
+                  codec_label(info), size / GiB, recompress_over, src)
 
     # 3. Encode to temp dir. Prefix with a hash of the full source path so two
     # files that share a basename in different library folders (common with
@@ -384,13 +675,23 @@ def process_file(src: Path, args, encoders: list[str], manifest: Manifest,
     name_hash = hashlib.sha1(str(src).encode("utf-8")).hexdigest()[:12]
     dst = tmp_dir / f"{name_hash}_{src.name}"
     dst.unlink(missing_ok=True)
+    mode = getattr(args, "interlace_mode", "auto")
+    deinterlace = resolve_interlaced(src, info, mode) if info else (mode == "force")
     manifest.set_status(str(src), size, "encoding", encoder=encoder)
-    log.info("ENCODE [%s] %s (%.2f GiB)", encoder, src, size / GiB)
+    log.info("ENCODE [%s%s]%s %s (%.2f GiB)", encoder,
+             f" adapter={gpu_index}" if gpu_index is not None else "",
+             " [interlaced: decomb enabled]" if deinterlace else "", src, size / GiB)
     t0 = time.time()
+
+    def _progress_cb(msg: str, _name=src.name, _enc=encoder) -> None:
+        log.info("PROGRESS [%s] %s: %s", _enc, _name, msg)
+
     try:
         handbrake_encode(src, dst, encoder, args.quality, args.preset,
                          args.extra_arg or [], args.handbrake_cli,
-                         args.timeout)
+                         args.timeout, deinterlace=deinterlace,
+                         gpu_index=gpu_index, progress_cb=_progress_cb,
+                         subtitle_count=(info["subtitles"] if info else None))
     except Exception as exc:  # noqa: BLE001 - any encode failure must not kill the batch
         dst.unlink(missing_ok=True)
         log.error("FAIL (encode) %s: %s", src, exc)
@@ -443,7 +744,8 @@ def cmd_run(args) -> int:
     gpu_assign = [int(g) for g in str(args.gpu_assign).split(",")]
     if len(gpu_assign) != len(encoders):
         log.warning("--gpu-assign has %d entries for %d encoders; "
-                    "HandBrakeCLI adapter pinning is advisory (see README)",
+                    "extra/missing entries are ignored, unmapped encoders "
+                    "get no adapter pin (see README)",
                     len(gpu_assign), len(encoders))
     encoder_blacklist: dict[str, list[str]] = cfg.get("encoder_blacklist", {})
     est_ratio = float(cfg.get("estimate_ratio", 0.45))
@@ -455,6 +757,8 @@ def cmd_run(args) -> int:
                       resume=args.resume, encoder_blacklist=encoder_blacklist,
                       encoders=encoders)
 
+    recompress_over = getattr(args, "recompress_hevc_over", 0.0) or 0.0
+
     if args.dry_run:
         total = 0
         rows = []
@@ -464,20 +768,24 @@ def cmd_run(args) -> int:
             except OSError:
                 continue
             info = stream_info(p)
-            if info and is_h265(info):
+            if info and already_compressed(info) and not (recompress_over > 0 and size >= recompress_over * GiB):
                 rows.append((p, size, info, True))
                 continue
             rows.append((p, size, info, False))
         print(f"\nDRY RUN - {sum(1 for r in rows if not r[3])} file(s) would be encoded "
-              f"({sum(1 for r in rows if r[3])} already H.265, skipped):\n")
-        for p, size, info, hevc in rows:
+              f"({sum(1 for r in rows if r[3])} already HEVC/AV1, skipped):\n")
+        for p, size, info, already in rows:
             codec = f"{info['video_codec'] or 'unknown'}" if info else "unprobeable"
-            if hevc:
-                print(f"  SKIP (already H.265) {p}  [{size / GiB:.2f} GiB, codec={codec}]")
+            if already:
+                print(f"  SKIP (already {codec_label(info)}) {p}  [{size / GiB:.2f} GiB, codec={codec}]")
                 continue
             est = size * est_ratio
             total += size
-            print(f"  {p}  [{size / GiB:.2f} GiB, codec={codec}, "
+            interlaced = resolve_interlaced(p, info, args.interlace_mode) if info \
+                else (args.interlace_mode == "force")
+            recompress_prefix = f"RECOMPRESS (oversized {codec_label(info)}) " if (info and already_compressed(info)) else ""
+            print(f"  {recompress_prefix}{p}  [{size / GiB:.2f} GiB, codec={codec}, "
+                  f"interlaced={'yes' if interlaced else 'no'}, "
                   f"est. out ~{est / GiB:.2f} GiB]")
         print(f"\nTotal input: {total / GiB:.2f} GiB | "
               f"Rough est. output: {total * est_ratio / GiB:.2f} GiB "
@@ -489,15 +797,36 @@ def cmd_run(args) -> int:
         return 0
 
     stats = {"done": 0, "failed": 0, "locked": 0, "skipped-hevc": 0}
-    with ThreadPoolExecutor(max_workers=len(encoders),
-                            thread_name_prefix="encoder") as pool:
-        futures = {
-            pool.submit(process_file, p, args, encoders, manifest, i): p
-            for i, p in enumerate(candidates)
-        }
-        for fut in as_completed(futures):
-            result = fut.result()
-            stats[result] = stats.get(result, 0) + 1
+    stats_lock = threading.Lock()
+
+    # Partition candidates into one fixed lane per encoder up front, then run
+    # each lane on its own dedicated thread. A shared ThreadPoolExecutor fed
+    # index-parity-tagged jobs (the old approach) breaks the encoder/GPU
+    # binding as soon as one lane finishes or fails faster than the other:
+    # the freed worker just pulls the next queued job regardless of which
+    # slot it was tagged for, so both threads can end up running the SAME
+    # encoder (e.g. two qsv_h265 jobs stacked on one GPU while the nvenc lane
+    # sits idle). Dedicated per-lane threads guarantee each encoder/GPU only
+    # ever processes its own queue, one file at a time, matching the log.
+    lanes: list[list[Path]] = [[] for _ in encoders]
+    for i, p in enumerate(candidates):
+        lanes[i % len(encoders)].append(p)
+
+    def run_lane(lane_files: list[Path], encoder: str, gpu_index: int | None):
+        for p in lane_files:
+            result = process_file(p, args, encoder, manifest, gpu_index)
+            with stats_lock:
+                stats[result] = stats.get(result, 0) + 1
+
+    threads = []
+    for slot, encoder in enumerate(encoders):
+        gpu_index = gpu_assign[slot] if gpu_assign and slot < len(gpu_assign) else None
+        t = threading.Thread(target=run_lane, args=(lanes[slot], encoder, gpu_index),
+                             name=f"encoder-{slot}-{encoder}", daemon=False)
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join()
 
     manifest.close()
     log.info("Batch complete: %s", ", ".join(f"{k}={v}" for k, v in sorted(stats.items())))
@@ -529,7 +858,7 @@ def cmd_preflight(_args) -> int:
             out = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
                  "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, timeout=30, errors="replace")
             gpus = [l.strip() for l in out.stdout.splitlines() if l.strip()]
             print(f"\n  GPUs detected ({len(gpus)}):")
             for g in gpus:
@@ -571,6 +900,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="compress-library",
         description="H.265 media library compressor (HandBrakeCLI + ffprobe, "
                     "dual-GPU: qsv_h265 GPU0 / nvenc_h265 GPU1)")
+    p.add_argument("--version", action="version", version=f"compress-library {__version__}")
     sub = p.add_subparsers(dest="command")
 
     run = sub.add_parser("run", help="encode a library (default command)")
@@ -579,15 +909,29 @@ def build_parser() -> argparse.ArgumentParser:
                      help="list what would be encoded; encode nothing")
     run.add_argument("--min-size", type=float, default=2.0,
                      help="skip files smaller than this many GB (default 2)")
+    run.add_argument("--recompress-hevc-over", type=float, default=0.0,
+                     help="re-encode already-HEVC files at or above this many GB "
+                          "instead of unconditionally skipping them (default 0 = "
+                          "disabled, HEVC is always skipped). Use for oversized "
+                          "HEVC remuxes that were themselves encoded at a low RF "
+                          "and can still shrink further at this run's --quality")
     run.add_argument("--quality", type=float, default=25.0,
                      help="HandBrake constant-quality RF (default 25)")
     run.add_argument("--encoder", nargs="+",
-                     choices=["qsv_h265", "nvenc_h265"],
+                     choices=["qsv_h265", "nvenc_h265", "qsv_av1"],
                      default=["qsv_h265", "nvenc_h265"],
-                     help="encoder(s); pass both for one-encode-per-GPU (default both)")
+                     help="encoder(s); pass both qsv_h265+nvenc_h265 for one-encode-per-GPU "
+                          "(default). qsv_av1 uses Arc's AV1 hardware encode block instead of "
+                          "HEVC on the QSV lane (Arc-only; no consumer NVENC GPU can hardware-"
+                          "encode AV1 as of Ada/40-series, so there is no av1_nvenc) - e.g. "
+                          "--encoder qsv_av1 nvenc_h265")
     run.add_argument("--gpu-assign", default="0,1",
-                     help="GPU adapter index per encoder, comma list (default 0,1; "
-                          "advisory - see README caveats)")
+                     help="adapter index per encoder, comma list (default 0,1); "
+                          "for nvenc_h265 this is a CUDA device index sent as "
+                          "--encopts gpu=N (only 0 is valid on a single-NVIDIA-GPU "
+                          "box); for qsv_h265/qsv_av1 this is a oneVPL adapter index sent "
+                          "as --qsv-adapter=N (0 = HandBrake's own default, "
+                          "the highest hardware-generation Intel GPU present)")
     run.add_argument("--preset", metavar="FILE",
                      help="HandBrake preset JSON to import (--preset-import-file)")
     run.add_argument("--extra-arg", action="append",
@@ -597,6 +941,12 @@ def build_parser() -> argparse.ArgumentParser:
                      help="SSD temp dir for encodes (default ./temp)")
     run.add_argument("--duration-tolerance", type=float, default=2.0,
                      help="max duration drift in seconds (default 2)")
+    run.add_argument("--interlace-mode", choices=["auto", "force", "off"], default="auto",
+                     help="deinterlacing: auto detects interlaced sources (field_order, "
+                          "or an ffmpeg idet sample for vc1/mpeg2/mpeg1 codecs whose "
+                          "field_order is unreliable) and enables HandBrake's adaptive "
+                          "--comb-detect/--decomb; force always enables it; off never does "
+                          "(default auto)")
     run.add_argument("--timeout", type=int, default=6 * 3600,
                      help="per-file encode timeout, seconds (default 21600)")
     run.add_argument("--manifest", default=str(DEFAULT_MANIFEST),
@@ -631,7 +981,7 @@ def setup_logging(logfile: str):
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Allow `compress-library <root> ...` without the literal `run` subcommand.
-    if argv and argv[0] not in ("run", "preflight", "-h", "--help"):
+    if argv and argv[0] not in ("run", "preflight", "-h", "--help", "--version"):
         argv.insert(0, "run")
     parser = build_parser()
     args = parser.parse_args(argv)
